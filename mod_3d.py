@@ -268,3 +268,12 @@ def second_alignment(I_ref, I_k, I_j, mis_ref, th1_k,th1_j, norm, thresh, measur
       layers.append(Layer(full, th2_k, th2_j, model, int(inl.sum())))
       support = clean_mask(support & ~inl, open_px=3, close_px=3, min_area=min_area)
   return layers
+
+# -----------------------------------------------
+# Parallax
+# -----------------------------------------------
+def parallax(theta2, theta1, x, y, norm):
+  """mu = [u2, v2] - [u1, v1] at pixels (x, y): 2nd layer flow minus dominant flow"""
+  u2, v2 = eval_flow(theta2, x, y, norm)
+  u1, v1 = eval_flow(theta1, x, y, norm)
+  return np.stack([u2 - u1, v2 - v1], -1)

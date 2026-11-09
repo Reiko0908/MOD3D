@@ -20,7 +20,8 @@ IoU vs ground truth: 0.079994
 Recall vs ground truth: 0.908571
 Layers found: 3
 Layer details: affine area=2459 dflow=7.89px purity=0.97; quadratic area=24191 dflow=79.54px purity=0.00; affine area=1581 dflow=46.16px purity=0.00
-Checks passed: 16/16
+Layer parallax (px): 6.87, 70.88, 40.58
+Checks passed: 18/18
 
 Checks
 STEP 1 [PASS] all images same size (480, 640)
@@ -39,3 +40,5 @@ STEP 5 [PASS] at least one layer found 3 layers
 STEP 5 [PASS] every layer has its own motion (>0.5 px from dominant)
 STEP 5 [PASS] one layer covers the moving object covers 81% of it
 STEP 5 [PASS] that layer contains almost only the object purity 97%
+STEP 6 [PASS] every layer has parallax (> 0.75 px)
+STEP 6 [PASS] mover parallax matches the object's true displacement max error 0.20 px
