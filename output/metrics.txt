@@ -1,13 +1,35 @@
 Model: quadratic
-Initial dx: 51.078887
-Initial dy: -1.631167
-Translation x: 51.078887
-Translation y: -1.631167
-Mean error before: 0.173864
-Mean error after: 0.135422
-Error reduction (%): 22.110233
-Valid pixels: 154707
-Total pixels: 181737
-Valid ratio (%): 85.126859
-Theta: [51.078887  0.        0.       -1.631167  0.        0.        0.
-  0.      ]
+Reference: testcase/2d/frame_ref.png
+Other: testcase/2d/frame_j.png
+Other2: None
+Theta (ref->other): [-15.5875  -7.6724  -3.6848   0.0762   3.7597  -7.4593   3.5001  -1.2164]
+Theta (ref->other2): n/a
+Mean error before: 0.134882
+Mean error after: 0.009246
+Error reduction (%): 93.144944
+Valid pixels: 300691
+Total pixels: 307200
+Valid ratio (%): 97.881185
+Mean normal flow (px): 0.125832
+Mean intensity difference: 1.156355
+Threshold (px): 1.000000
+Mask pixels: 3324
+Mask fraction of valid (%): 1.105454
+Pairs used: 1
+IoU vs ground truth: 0.752643
+Recall vs ground truth: 0.909244
+Checks passed: 12/12
+
+Checks
+STEP 1 [PASS] all images same size (480, 640)
+STEP 1 [PASS] gray is float32 in [0,1]
+STEP 1 [PASS] fill_holes fills a ring (expect 900) got 900
+STEP 1 [PASS] clean_mask removes a speck (expect 0)
+STEP 2 [PASS] CoordNorm centre/scale cx=319.5, cy=239.5, s=320.0
+STEP 2 [PASS] zero motion warp is identity
+STEP 2 [PASS] dense field == pointwise eval_flow
+STEP 3 [PASS] recovers a KNOWN motion from your ref image max |theta error| = 0.000
+STEP 3 [PASS] GN did not stall (quadratic terms moved)
+STEP 3 [PASS] alignment lowers the error 0.1349 -> 0.0092  (93.1% lower)
+STEP 4 [PASS] mask is not empty and not the whole image 1.11% of valid pixels
+STEP 4 [PASS] mask overlaps ground truth IoU 0.75, recall 0.91  (one pair: ghost at the other position is expected, add --other2)

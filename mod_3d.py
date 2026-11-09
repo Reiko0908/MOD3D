@@ -149,7 +149,7 @@ def gauss_newton(ref, other, theta0=None, model="quadratic", mask=None, norm=Non
     xn = (xs * sc + origin_xy[0] - norm.cx) / norm.s  # full-image coords
     yn = (ys * sc + origin_xy[1] - norm.cy) / norm.s
     bu, bv = _flow_jacobian(xn.astype(np.float64), yn.astype(np.float64))
-    sel = np.zeros((h, w), bool) if pm is None else pm[lvl] > 0.5
+    sel = np.ones((h, w), bool) if pm is None else pm[lvl] > 0.5
     sel[:1, :] = sel[-1:, :] = False
     sel[:, :1] = sel[:, -1:] = False
     if sel.sum() < 4 * len(idx): continue
@@ -192,3 +192,21 @@ def dominant_motion(ref, other, norm=None):
  dx, dy = correlation_shift(ref, other)
  theta0 = np.array([dx, 0, 0, dy, 0, 0, 0, 0], np.float64)
  return gauss_newton(ref, other, theta0, "quadratic", norm=norm)
+
+# -----------------------------------------------
+# Misalignment
+# -----------------------------------------------
+def misalignment_map(ref,warped, win=7, noise=0.01, measure="normal_flow"):
+  """normal_flow: residual displacement in pixels (threshold ~1.0)
+     intensity: |I_ref - I_warped| in grey levels (threshold ~6)"""
+  a = cv2.GaussianBlur(to_gray(ref), (0,0), 1.0)
+  b = cv2.GaussianBlur(to_gray(warped), (0,0), 1.0)
+  it = b - a
+  if measure == "intensity":
+    return cv2.boxFilter(np.abs(it), -1, (win, win)) * 255.0
+  m = 0.5 * (a + b)
+  gx = cv2.Sobel(m, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+  gy = cv2.Sobel(m, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+  num = cv2.boxFilter(it * it, -1, (win, win))
+  den = cv2.boxFilter(gx * gx + gy * gy, -1, (win, win))
+  return np.sqrt(np.maximum(num, 0) / (np.maximum(den, 0) + (3 * noise) ** 2))
