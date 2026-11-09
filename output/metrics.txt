@@ -1,0 +1,13 @@
+Model: quadratic
+Initial dx: 51.078887
+Initial dy: -1.631167
+Translation x: 51.078887
+Translation y: -1.631167
+Mean error before: 0.173864
+Mean error after: 0.135422
+Error reduction (%): 22.110233
+Valid pixels: 154707
+Total pixels: 181737
+Valid ratio (%): 85.126859
+Theta: [51.078887  0.        0.       -1.631167  0.        0.        0.
+  0.      ]
