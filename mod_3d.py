@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass, field
+from sys import implementation
 
 import cv2
 import numpy as np
@@ -198,7 +199,7 @@ def dominant_motion(ref, other, norm=None):
 # -----------------------------------------------
 def misalignment_map(ref,warped, win=7, noise=0.01, measure="normal_flow"):
   """normal_flow: residual displacement in pixels (threshold ~1.0)
-     intensity: |I_ref - I_warped| in grey levels (threshold ~6)"""
+  intensity: |I_ref - I_warped| in grey levels (threshold ~6)"""
   a = cv2.GaussianBlur(to_gray(ref), (0,0), 1.0)
   b = cv2.GaussianBlur(to_gray(warped), (0,0), 1.0)
   it = b - a
@@ -210,3 +211,60 @@ def misalignment_map(ref,warped, win=7, noise=0.01, measure="normal_flow"):
   num = cv2.boxFilter(it * it, -1, (win, win))
   den = cv2.boxFilter(gx * gx + gy * gy, -1, (win, win))
   return np.sqrt(np.maximum(num, 0) / (np.maximum(den, 0) + (3 * noise) ** 2))
+
+# -----------------------------------------------
+# Second alignment per misaligned region
+# -----------------------------------------------
+@dataclass
+class Layer:
+  mask: np.ndarray # boll, full ref frame
+  theta_k: np.ndarray # 2nd motion ref -> k
+  theta_j: np.ndarray # 2nd motion ref -> j
+  model: str
+  area: int = 0
+  parallax: float = 0.0 # median |mu|
+  score: float = 0.0 # mean rigidity score
+  moving: bool = False
+
+def _sub_model(area):
+  """Simplier model for smaller region (fewer pixels -> fewer params)"""
+  if area < 1200:
+    return "translation"
+  if area < 15000:
+    return "affine"
+  return "quadratic"
+
+def second_alignment(I_ref, I_k, I_j, mis_ref, th1_k,th1_j, norm, thresh, measure="normal_flow",
+                     min_area=60, max_layers_per_region=3, margin=40, min_inlier_frac=0.25):
+  """For every misaligned region fit a 2nd 2D parametric motion (started from
+  the dominant one), keep the pixels it aligns, repeat on what is left"""
+  R, K, J = to_gray(I_ref), to_gray(I_k), to_gray(I_j)
+  H, W = R.shape
+  layers = []
+  n, lab, stats, _ = cv2.connectedComponentsWithStats(mis_ref.astype(np.uint8), connectivity=8)
+  for c in range(1, n):
+    x, y, bw, bh, area = stats[c]
+    if area < min_area: continue
+    x0, y0 = max(0, x - margin), max(0, y - margin)
+    x1, y1 = min(W, x + bw + margin), min(H, y + bh + margin)
+    Rc, Kc, Jc = R[y0:y1, x0:x1], K[y0:y1, x0:x1], J[y0:y1, x0:x1]
+    support = lab[y0:y1, x0:x1] == c
+    lv = _n_levels(Rc.shape, min_size=16, max_levels=3)
+    for _ in range(max_layers_per_region):
+      s_area = int(support.sum())
+      if s_area < min_area: break
+      model = _sub_model(s_area)
+      th2_k = gauss_newton(Rc, Kc, th1_k, model, support, norm, origin_xy=(x0,y0), levels=lv)
+      th2_j = gauss_newton(Rc, Jc, th1_j, model, support, norm, origin_xy=(x0,y0), levels=lv)
+      wk, _ = backward_warp(Kc, *model_flow_field(th2_k, Rc.shape, norm, origin_xy=(x0,y0)))
+      wj, _ = backward_warp(Jc, *model_flow_field(th2_j, Rc.shape, norm, origin_xy=(x0,y0)))
+      rk = misalignment_map(Rc, wk, measure=measure)
+      rj = misalignment_map(Rc, wj, measure=measure)
+      inl = support & (rk < thresh) & (rj < thresh)
+      inl = clean_mask(inl, open_px=3, close_px=5, min_area=min_area // 2)
+      if inl.sum() < max(min_area, min_inlier_frac * s_area): break
+      full = np.zeros((H, W), bool)
+      full[y0:y1, x0:x1] = inl
+      layers.append(Layer(full, th2_k, th2_j, model, int(inl.sum())))
+      support = clean_mask(support & ~inl, open_px=3, close_px=3, min_area=min_area)
+  return layers

@@ -1,24 +1,26 @@
 Model: quadratic
-Reference: testcase/2d/frame_ref.png
-Other: testcase/2d/frame_j.png
-Other2: None
-Theta (ref->other): [-15.5875  -7.6724  -3.6848   0.0762   3.7597  -7.4593   3.5001  -1.2164]
-Theta (ref->other2): n/a
-Mean error before: 0.134882
-Mean error after: 0.009246
-Error reduction (%): 93.144944
-Valid pixels: 300691
+Reference: testcase/layers/frame_ref.png
+Other: testcase/layers/frame_j.png
+Other2: testcase/layers/frame_k.png
+Theta (ref->other): [-15.5974  -7.6782  -3.6848   0.0695   3.7754  -7.4862   3.5265  -1.2365]
+Theta (ref->other2): [16.3995  7.7028  3.9986  0.0677 -3.9146  7.9177 -3.8809  1.239 ]
+Mean error before: 0.143918
+Mean error after: 0.029878
+Error reduction (%): 79.239206
+Valid pixels: 300710
 Total pixels: 307200
-Valid ratio (%): 97.881185
-Mean normal flow (px): 0.125832
-Mean intensity difference: 1.156355
+Valid ratio (%): 97.887370
+Mean normal flow (px): 0.769818
+Mean intensity difference: 6.492545
 Threshold (px): 1.000000
-Mask pixels: 3324
-Mask fraction of valid (%): 1.105454
-Pairs used: 1
-IoU vs ground truth: 0.752643
-Recall vs ground truth: 0.909244
-Checks passed: 12/12
+Mask pixels: 33518
+Mask fraction of valid (%): 11.146287
+Pairs used: 2
+IoU vs ground truth: 0.079994
+Recall vs ground truth: 0.908571
+Layers found: 3
+Layer details: affine area=2459 dflow=7.89px purity=0.97; quadratic area=24191 dflow=79.54px purity=0.00; affine area=1581 dflow=46.16px purity=0.00
+Checks passed: 16/16
 
 Checks
 STEP 1 [PASS] all images same size (480, 640)
@@ -30,6 +32,10 @@ STEP 2 [PASS] zero motion warp is identity
 STEP 2 [PASS] dense field == pointwise eval_flow
 STEP 3 [PASS] recovers a KNOWN motion from your ref image max |theta error| = 0.000
 STEP 3 [PASS] GN did not stall (quadratic terms moved)
-STEP 3 [PASS] alignment lowers the error 0.1349 -> 0.0092  (93.1% lower)
-STEP 4 [PASS] mask is not empty and not the whole image 1.11% of valid pixels
-STEP 4 [PASS] mask overlaps ground truth IoU 0.75, recall 0.91  (one pair: ghost at the other position is expected, add --other2)
+STEP 3 [PASS] alignment lowers the error 0.1439 -> 0.0299  (79.2% lower)
+STEP 4 [PASS] mask is not empty and not the whole image 11.15% of valid pixels
+STEP 4 [PASS] mask overlaps ground truth IoU 0.08, recall 0.91
+STEP 5 [PASS] at least one layer found 3 layers
+STEP 5 [PASS] every layer has its own motion (>0.5 px from dominant)
+STEP 5 [PASS] one layer covers the moving object covers 81% of it
+STEP 5 [PASS] that layer contains almost only the object purity 97%
