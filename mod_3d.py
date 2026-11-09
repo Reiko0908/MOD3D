@@ -277,3 +277,27 @@ def parallax(theta2, theta1, x, y, norm):
   u2, v2 = eval_flow(theta2, x, y, norm)
   u1, v1 = eval_flow(theta1, x, y, norm)
   return np.stack([u2 - u1, v2 - v1], -1)
+
+# -----------------------------------------------
+# Parallax-based rigidity constraint
+# -----------------------------------------------
+def _perp(v):
+  return np.stack([-v[..., 1], v[..., 0]], -1)
+
+def rigidity_inconsistency(p1, mu1k, mu1j, p2, mu2k, mu2j, noise_px=0.3):
+  """Point p2 against a static reference point p1.
+  With p_w = p + mu (position after the plane alignment) and dpw = pw2 - pw1:
+    a = mu2k . dpw_k_perp   b = mu1k . dpw_k_perp
+    c = mu2j . dpw_j_perp   d = mu1j . dpw_j_perp
+  A static point satisfies  a/b = c/d,  i.e.  a*d - c*b = 0.
+  Returns (score in [0, 1], raw a*d - c*b).  tau keeps the score near 0 when the parallax is at noise level."""
+  dk = (p2 + mu2k) - (p1 + mu1k)
+  dj = (p2 + mu2j) - (p1 + mu1j)
+  a = (mu2k * _perp(dk)).sum(-1)
+  b = (mu1k * _perp(dk)).sum(-1)
+  c = (mu2j * _perp(dj)).sum(-1)
+  d = (mu1j * _perp(dj)).sum(-1)
+  raw = a * d - c * b
+  tau = noise_px ** 2 * np.linalg.norm(dk, axis=-1) * np.linalg.norm(dj, axis=-1)
+  score = np.abs(raw) / (np.abs(a * d) + np.abs(c * b) + tau + 1e-12)
+  return score, raw

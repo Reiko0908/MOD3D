@@ -18,10 +18,11 @@ Mask fraction of valid (%): 11.146287
 Pairs used: 2
 IoU vs ground truth: 0.079994
 Recall vs ground truth: 0.908571
-Layers found: 3
-Layer details: affine area=2459 dflow=7.89px purity=0.97; quadratic area=24191 dflow=79.54px purity=0.00; affine area=1581 dflow=46.16px purity=0.00
-Layer parallax (px): 6.87, 70.88, 40.58
-Checks passed: 18/18
+Layers found: 2
+Layer details: affine area=2402 dflow=7.89px purity=0.97; quadratic area=21435 dflow=78.75px purity=0.00
+Layer parallax (px): 6.87, 70.76
+Layer rigidity scores: 0.336, 0.000
+Checks passed: 20/20
 
 Checks
 STEP 1 [PASS] all images same size (480, 640)
@@ -36,9 +37,11 @@ STEP 3 [PASS] GN did not stall (quadratic terms moved)
 STEP 3 [PASS] alignment lowers the error 0.1439 -> 0.0299  (79.2% lower)
 STEP 4 [PASS] mask is not empty and not the whole image 11.15% of valid pixels
 STEP 4 [PASS] mask overlaps ground truth IoU 0.08, recall 0.91
-STEP 5 [PASS] at least one layer found 3 layers
+STEP 5 [PASS] at least one layer found 2 layers
 STEP 5 [PASS] every layer has its own motion (>0.5 px from dominant)
-STEP 5 [PASS] one layer covers the moving object covers 81% of it
+STEP 5 [PASS] one layer covers the moving object covers 79% of it
 STEP 5 [PASS] that layer contains almost only the object purity 97%
 STEP 6 [PASS] every layer has parallax (> 0.75 px)
 STEP 6 [PASS] mover parallax matches the object's true displacement max error 0.20 px
+STEP 7 [PASS] moving object scores above threshold score 0.336 (threshold 0.15)
+STEP 7 [PASS] every other layer is static scores 0.000
