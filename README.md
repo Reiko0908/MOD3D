@@ -5,7 +5,7 @@ This repository contains the implementation and description of the Moving Detect
 ## MOVING DETECTION ALGORITHM
 Assuming a 2D scene, that is a 3D scene that can be represented or modelled according to a plane in 3D space. We have the following equation to determine the optical flow:
 
-$$ \begin{bmatrix} u(x, y) \\ v(x, y) \end{bmatrix} = \begin{bmatrix} a + b \cdot x + c \cdot y + g \cdot x^2 + h \cdot xy \\\\ d + e \cdot x + f \cdot y + g \cdot xy + h \cdot y^2 \end{bmatrix} $$
+$$ \begin{bmatrix} u(x, y) \\\\ v(x, y) \end{bmatrix} = \begin{bmatrix} a + b \cdot x + c \cdot y + g \cdot x^2 + h \cdot xy \\\\ d + e \cdot x + f \cdot y + g \cdot xy + h \cdot y^2 \end{bmatrix} $$
 
 This formulation works well when the 3D scene is far away from the camera, or that it can be sufficiently modelled as to be on the plane. Using this formulation, we can easily compute the Intensity Difference between the Reference Image and the Inspection Image then mask the area with large intensity differences as motion.
 
