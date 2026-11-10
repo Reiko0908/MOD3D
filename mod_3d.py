@@ -301,3 +301,131 @@ def rigidity_inconsistency(p1, mu1k, mu1j, p2, mu2k, mu2j, noise_px=0.3):
   tau = noise_px ** 2 * np.linalg.norm(dk, axis=-1) * np.linalg.norm(dj, axis=-1)
   score = np.abs(raw) / (np.abs(a * d) + np.abs(c * b) + tau + 1e-12)
   return score, raw
+
+# -----------------------------------------------
+# Full pipeline
+# -----------------------------------------------
+@dataclass
+class MOD:
+  mask: np.ndarray # I_motion (bool, ref frame)
+  mask_2d: np.ndarray
+  mis_ref: np.ndarray # I_ref^misaligned
+  theta1_k: np.ndarray
+  theta1_j: np.ndarray
+  layers: list = field(default_factory=list)
+  ref_points: np.ndarray | None = None
+  score_map: np.ndarray | None = None
+  mode: str = ""
+
+def detect_motion(I_k, I_ref, I_j, ref_point=None, thresh: float = 1.0, score_thresh: float = 0.25, consensus_thresh: float = 0.1,
+                  plane_tol: float = 0.75, measure: str = "normal_flow", min_area: int = 60, max_layers_per_region: int = 3, n_refs: int = 15, seed: int = 0) -> MOD:
+  R = to_gray(I_ref)
+  H, W = R.shape
+  norm = CoordNorm.from_shape(R.shape)
+
+  # 1-2: Dominant 2D parametric motion (ref -> k, ref -> j)
+  th1_k = dominant_motion(R, I_k, norm)
+  th1_j = dominant_motion(R, I_j, norm)
+
+  # 3-4: Align and find the misaligned areas
+  Wk, vk = align_frame(I_k, th1_k, norm, R.shape)
+  Wj, vj = align_frame(I_j, th1_j, norm, R.shape)
+  mis_k = (misalignment_map(R, Wk, measure=measure) > thresh) & vk
+  mis_j = (misalignment_map(R, Wj, measure=measure) > thresh) & vj
+  mis_ref = clean_mask(mis_k & mis_j, min_area=min_area)
+  mask_2d = fill_holes(mis_ref)
+
+  # 5-6: Second alignment on the misaligned areas
+  layers = second_alignment(R, I_k, I_j, mis_ref, th1_k, th1_j, norm, thresh, measure, min_area, max_layers_per_region)
+
+  # 7: Parallax per layer (sampled pixels for speed)
+  rng = np.random.default_rng(seed)
+  samples = []
+  for L in layers:
+    ys, xs = np.nonzero(L.mask)
+    pick = rng.choice(len(xs), size=min(400, len(xs)), replace=False)
+    pts = np.stack([xs[pick], ys[pick]], -1).astype(np.float64)
+    muk = parallax(L.theta_k, th1_k, pts[:, 0], pts[:, 1], norm)
+    muj = parallax(L.theta_j, th1_j, pts[:, 0], pts[:, 1], norm)
+    L.parallax = float(np.median(np.maximum(np.linalg.norm(muk, axis=1), np.linalg.norm(muj, axis=1))))
+    samples.append((pts, muk, muj))
+
+  cand = [i for i, L in enumerate(layers) if L.parallax > plane_tol]
+
+  def point_mu(i, p):
+    L = layers[i]
+    return (parallax(L.theta_k, th1_k, p[0], p[1], norm),
+            parallax(L.theta_j, th1_j, p[0], p[1], norm))
+
+  def layer_score(i_ref, p_ref, i):
+    m1k, m1j = point_mu(i_ref, p_ref)
+    pts, muk, muj = samples[i]
+    s, _ = rigidity_inconsistency(np.asarray(p_ref, float), m1k, m1j, pts, muk, muj)
+    return s
+
+  def representative(i):
+    pts = samples[i][0]
+    return np.median(pts, axis=0)
+
+  # 8: A point known to be static
+  mode = "parallax"
+  if ref_point is not None:
+    x, y = round(ref_point[0]), round(ref_point[1])
+    owner = [i for i, L in enumerate(layers) if L.mask[min(max(y, 0), H - 1), min(max(x, 0), W - 1)]]
+    if not owner:
+      best, owner = None, []
+      for i in cand:
+        ys, xs = np.nonzero(layers[i].mask)
+        d = np.min((xs - x) ** 2 + (ys - y) ** 2)
+        if best is None or d < best:
+          best, owner = d, [i]
+    if not owner:
+      raise ValueError("ref_point: no misaligned region w/ parallax near this point")
+    ref_layers = owner
+    refs = [(owner[0], np.array([x, y], float))]
+  elif len(cand) < 2:
+    # Nothing to compare w/: no static point w/ parallax can be established,
+    # so the scene is treated as 2D (every misaligned area moves)
+    mode = "2d-fallback"
+    ref_layers, refs = [], []
+  else:
+    # consensus: the candidate that is strictly consistent (score below
+    # consensus_thresh) with the largest misaligned area is the static anchor
+    best_i, best_area = None, -1
+    for i in cand:
+      p = representative(i)
+      area = sum(layers[i].area for j in cand if np.median(layer_score(i, p, j)) < consensus_thresh)
+      if area > best_area:
+        best_i, best_area = i, area
+    p = representative(best_i)
+    ref_layers = [i for i in cand if np.median(layer_score(best_i, p, i)) < consensus_thresh]
+    # one re-selection round: keep the layers that agree w/ the whole set
+    refs = [(j, representative(j)) for j in ref_layers][:n_refs]
+    med = {j: np.median(np.median(np.stack([layer_score(ir, pr, j) for ir, pr in refs]), axis=0)) for j in cand}
+    ref_layers = [j for j in cand if med[j] < consensus_thresh] or [best_i]
+    refs = [(j, representative(j)) for j in ref_layers][:n_refs]
+
+  # 9: Rigidity test against the static reference point(s)
+  score_map = np.zeros((H, W), np.float32)
+  for i, L in enumerate(layers):
+    if mode == "2d-fallback":
+      L.score, L.moving = 1.0, True
+      continue
+    if L.parallax <= plane_tol: # aligned by the dominant motion
+      L.score, L.moving = 0.0, False
+      continue
+    s = np.median(np.stack([layer_score(ir, pr, i) for ir, pr in refs]), axis=0)
+    L.score = float(np.median(s))
+    L.moving = L.score > score_thresh # "!= 0" with a tolerance
+    score_map[L.mask] = L.score
+
+  if mode == "2d-fallback":
+    mask = mask_2d
+  else:
+    moving = np.zeros((H, W), bool)
+    for L in layers:
+      if L.moving:
+        moving |= L.mask
+    mask = fill_holes(clean_mask(moving, min_area=min_area))
+  ref_pts = np.array([pr for _, pr in refs], float) if refs else None
+  return MOD(mask, mask_2d, mis_ref, th1_k, th1_j, layers, ref_pts, score_map, mode)
