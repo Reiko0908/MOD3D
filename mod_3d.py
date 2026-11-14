@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 # ============================================================
-# UTILITIES
+# 1. UTILITIES
 # ============================================================
 """Low-level tensor utilities (all GPU-friendly, pure PyTorch).
 
@@ -187,7 +187,7 @@ def border_mask(H: int, W: int, margin: int, device) -> torch.Tensor:
   return m
 
 # ============================================================
-# 2D PARAMETRIC MOTION + DOMINANT-MOTION INITIALISATION
+# 2. 2D PARAMETRIC MOTION + DOMINANT-MOTION INITIALIZATION
 # ===========================================================
 MODELS = {"translation", "affine", "quadratic", "homography"}
 # indices into the 8-vector for each model family
@@ -406,5 +406,27 @@ def est_dominant(ref: torch.Tensor, insp: torch.Tensor, cfg: ParamConfig = Param
   Wp, valid = warp_img(I, p, cfg.model)
   M, tex = norm_flow_misalign(R, Wp, 2)
   good = ((M < align_thr) & (tex > 2e-4) & valid).float().mean(dim=(1, 2, 3)).view(n, B)
-  best = good.argmax(0)                                        # (B,)
+  best = good.argmax(0) # (B,)
   return p.view(n, B, 8)[best, torch.arange(B, device=p.device)]
+
+# ============================================================
+# 3. LOCAL MISALIGNMENT
+# ============================================================
+@torch.no_grad()
+def norm_flow_misalign(ref: torch.Tensor, warped: torch.Tensor, radius: int = 2,
+                       eps: float = 1e-5, presmooth: float = 0.8) -> tuple[torch.Tensor, torch.Tensor]:
+  """Return (M, texture) both (B,1,H,W). M in pixels"""
+  if presmooth > 0:
+    ref = gauss_blur(ref, presmooth)
+    warped = gauss_blur(warped, presmooth)
+  gx, gy = grad(0.5 * (ref + warped))
+  g2 = gx * gx + gy * gy
+  diff = (ref - warped).abs()
+  num = box_filter(diff * g2.sqrt(), radius)
+  tex = box_filter(g2, radius)
+  return num / (tex + eps), tex
+
+def misalignment_mask(M: torch.Tensor, texture: torch.Tensor, valid: torch.Tensor,
+                      thr: float = 0.5, tex_thr: float = 2e-4) -> torch.Tensor:
+    """Boolean mask of misaligned (moving or parallax) pixels."""
+    return (M > thr) & (texture > tex_thr) & valid.bool()
