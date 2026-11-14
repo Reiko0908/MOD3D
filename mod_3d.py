@@ -1,431 +1,188 @@
+"""
+mod_3d.py
+Plane + parallax moving-object detection for monocular video (PyTorch, CUDA when available).
+Implements M. Irani & P. Anandan, "A Unified Approach to Moving Object Detection in 2D and 3D
+Scenes", IEEE TPAMI 20(6), 1998.
+
+Sections:
+    1. Utilities
+    2. 2D Parametric Motion (Eq. 2, 4) & Dominant-Motion Initialisation
+    3. Local Misalignment
+    4. Dense Planar-Parallax Flow (Eq. 5-6)
+    5. Parallax Rigidity Constraint (Eq. 7-8)
+    6. Moving Object Detector (Steps 1-9 + Stratification)
+"""
+
 from __future__ import annotations
 
 import argparse
-from collections import deque
-from dataclasses import dataclass, field
-from sys import implementation
+import json
+import math
+import os
+import sys
+import time
+from collections import OrderedDict
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 
+# ===============================================
+# UTILITIES
+# ===============================================
+"""Low-level tensor utilities (all GPU-friendly, pure PyTorch).
 
-# -----------------------------------------------
-# Image Preprocessing
-# -----------------------------------------------
-def to_gray(img):
-  """float32 grayscale in [0, 1]"""
-  if img.ndim == 3:
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-  if img.dtype == np.uint8:
-    img = img.astype(np.float32) / 255.0
-  return img.astype(np.float32)
+Conventions
+-----------
+* Images are float tensors of shape (B, 1, H, W) with values in [0, 1].
+* "Normalized" coordinates follow ``grid_sample(..., align_corners=True)``:
+  x_n = 2 x / (W - 1) - 1, y_n = 2 y / (H - 1) - 1, so pixel centres of the
+  corner pixels are at -1 / +1.  Parametric motion models are expressed in
+  normalized coordinates so their parameters are resolution independent
+  (this makes coarse-to-fine propagation trivial).
+* Flows / displacements returned to the user are in **pixels**.
+"""
 
-def clean_mask(mask, open_px=3, close_px=7, min_area=40):
-  """Remove specks (opening), close small gaps, drop blobs smaller than min_area."""
-  m = mask.astype(np.uint8)
-  if open_px > 1:
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN,
-                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_px,) * 2))
-  if close_px > 1:
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE,
-                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px,) * 2))
-  n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-  keep = np.zeros(n, bool)
-  keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area
-  return keep[lab]
+# -------------------------- Device --------------------------
+def get_device(prefer: str | None = None) -> torch.device:
+  if prefer is not None:
+    return torch.device(prefer)
+  if torch.cuda.is_available():
+    return torch.device("cuda")
+  if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+      return torch.device("mps")
+  return torch.device("cpu")
 
-def fill_holes(mask):
-  """Fill each blob's interior (an untextured object is only misaligned at its edges)."""
-  m = mask.astype(np.uint8)
-  cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-  out = np.zeros_like(m)
-  cv2.drawContours(out, cnts, -1, 1, thickness=cv2.FILLED)
-  return out > 0
+def frame_to_tensor(frame, device: torch.device) -> torch.Tensor:
+  """uint8 HxW or HxWx3 (RGB or BGR - luminance weights are near-symmetric) -> (1,1,H,W) float"""
+  t = torch.as_tensor(frame, device=device)
+  if t.ndim == 3:
+      t = t.float()
+      t = 0.299 * t[..., 0] + 0.587 * t[..., 1] + 0.114 * t[..., 2]
+  else:
+      t = t.float()
+  return (t / 255.0)[None, None]
 
-# -----------------------------------------------
-# 8-parameter quadratic motion model
-# -----------------------------------------------
+# -------------------------- Filtering --------------------------
+def _gauss1d(sigma: float, device, dtype) -> torch.Tensor:
+  """1D Gaussian blur along the last dimension of a 4D tensor"""
+  r = max(1, math.ceil(3.0 * sigma))
+  x = torch.arange(-r, r + 1, device=device, dtype=dtype)
+  k = torch.exp(-0.5 * (x / sigma) ** 2)
+  return k / k.sum()
 
-# theta = [a, b, c, d, e, f, g, h]
-MODEL_INDICIES = {"translation": [0, 3],
-                  "affine": [0, 1, 2, 3, 4, 5],
-                  "quadratic": [0, 1, 2, 3, 4, 5, 6, 7]}
+def gaussian_blur(img: torch.Tensor, sigma: float) -> torch.Tensor:
+  """Separable Gaussian blur with replicate padding. img: (B,C,H,W)"""
+  if sigma <= 0:
+    return img
+  k = _gauss1d(sigma, img.device, img.dtype)
+  r = (k.numel() - 1) // 2
+  C = img.shape[1]
+  kx = k.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
+  ky = k.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
+  out = F.pad(img, (r, r, 0, 0), mode="replicate")
+  out = F.conv2d(out, kx, groups=C)
+  out = F.pad(out, (0, 0, r, r), mode="replicate")
+  out = F.conv2d(out, ky, groups=C)
+  return out
 
-@dataclass(frozen=True)
-class CoordNorm:
-  """Coordinate normalization x_n = (c-cx) / s (conditioning of x^2, xy, y^2)"""
-  cx: float
-  cy: float
-  s: float
+def box_filter(img: torch.Tensor, radius: int) -> torch.Tensor:
+  """Mean over a (2r+1)^2 window; borders use only valid pixels"""
+  if radius <= 0:
+    return img
+  k = 2 * radius + 1
+  return F.avg_pool2d(img, k, stride=1, padding=radius, count_include_pad=False)
 
-  @staticmethod
-  def from_shape(shape):
-    h,w = shape[:2]
-    return CoordNorm((w - 1) / 2.0, (h - 1) / 2.0, max(w, h) / 2.0)
+def gradients(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+  """Central-difference image gradients in pixel units (replicate border)."""
+  p = F.pad(img, (1, 1, 1, 1), mode="replicate")
+  gx = 0.5 * (p[..., 1:-1, 2:] - p[..., 1:-1, :-2])
+  gy = 0.5 * (p[..., 2:, 1:-1] - p[..., :-2, 1:-1])
+  return gx, gy
 
-def _flow_jacobian(xn, yn):
-  """du/dθ, dv/dθ for the quadratic model, shape (..., 8), used by Gauss-Newton"""
-  o, z = np.ones_like(xn), np.zeros_like(xn)
-  bu = np.stack([o, xn, yn, z, z, z, xn * xn, xn * yn], -1)
-  bv = np.stack([z, z, z, o, xn, yn, xn * yn, yn * yn], -1)
-  return bu, bv
+def median_filter3(x: torch.Tensor) -> torch.Tensor:
+  """3x3 median filter (per channel)"""
+  B, C, H, W = x.shape
+  p = F.pad(x, (1, 1, 1, 1), mode="replicate")
+  patches = F.unfold(p, 3) # (B, C*9, H*W)
+  patches = patches.view(B, C, 9, H * W)
+  return patches.median(dim=2).values.view(B, C, H, W)
 
-def eval_flow(theta, x, y, norm):
-  """Flow in pixels at pixel coordinates x, y"""
-  a, b, c, d, e, f, g, h = theta
-  xn = (np.asarray(x, np.float64) - norm.cx) / norm.s
-  yn = (np.asarray(y, np.float64) - norm.cy) / norm.s
-  u = a + b * xn + c * yn + g * xn * xn + h * xn * yn
-  v = d + e * xn + f * yn + g * xn * yn + h * yn * yn
-  return u, v
+def dialate(mask: torch.Tensor, radius: int) -> torch.Tensor:
+  """Dilate a binary mask by a given radius (in pixels)"""
+  if radius <= 0:
+    return mask
+  m = mask.float()
+  return F.max_pool2d(m, 2 * radius + 1, stride=1, padding=radius) > 0.5
 
-def model_flow_field(theta, shape, norm, origin_xy=(0, 0)):
-  """Dense flow (u, v) on a grid of `shape` whose top-left pixel is `origin`"""
-  h, w = shape[:2]
-  ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
-  u, v = eval_flow(theta, xs + origin_xy[0], ys + origin_xy[1], norm)
-  return u.astype(np.float32), v.astype(np.float32)
+def erode(mask: torch.Tensor, radius: int) -> torch.Tensor:
+  if radius <= 0:
+    return mask
+  return ~dialate(~mask.bool(), radius)
 
-def backward_warp(img, u, v):
-  """out(x) = img(x + flow(x)), and a mask of pixels that landed inside img"""
-  h, w = img.shape[:2]
-  ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-  mx, my = xs + u, ys + v
-  out = cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-  inside = (mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)
-  return out, inside
+# -------------------------- Pyramids --------------------------
+def build_pyramid(img: torch.Tensor, levels: int, kind: str = "gaussian") -> list[torch.Tensor]:
+  """Returns list [finest, ..., coarsest].
+  kind = 'gaussian'  : low-pass images.
+  kind = 'laplacian' : band-pass images  (I - G*I), as in Irani & Anandan
+  Sec. 2.1; less sensitive to illumination changes.
+  """
+  pyr = [img]
+  for _ in range(levels - 1):
+    b = gaussian_blur(pyr[-1], 1.0)
+    pyr.append(b[..., ::2, ::2].contiguous())
+  if kind == "laplacian":
+    pyr = [p - gaussian_blur(p, 2.0) for p in pyr]
+  elif kind != "gaussian":
+    raise ValueError(kind)
+  return pyr
 
-
-def align_frame(other, theta, norm, shape=None, margin=8):
-  """'Align' of the description: bring `other` into the reference frame"""
-  shape = shape or other.shape[:2]
-  u, v = model_flow_field(theta, shape, norm)
-  warped, inside = backward_warp(to_gray(other), u, v)
-  if margin:
-    inside = (
-      cv2.erode(inside.astype(np.uint8), np.ones((2 * margin + 1,) * 2, np.uint8)) > 0
-    )
-  return warped, inside
-
-# -----------------------------------------------
-# Direct Gauss-Newton estimation
-# -----------------------------------------------
-def _n_levels(shape, min_size=24, max_levels=5):
-  """Number of pyramid levels for Gauss-Newton"""
-  n, m = 0, min(shape[:2])
-  while m / 2 ** (n + 1) >= min_size and n < max_levels:
+def auto_levels(H: int, W: int, min_size: int = 24, max_levels: int = 6) -> int:
+  n = 1
+  while min(H, W) / (2 ** n) >= min_size and n < max_levels:
     n += 1
   return n
 
-def gauss_newton(ref, other, theta0=None, model="quadratic", mask=None, norm=None,
-                 origin_xy=(0,0), levels=None, iters=15, init_translation=True):
-  """θ such that other(x + flow(x; θ)) ~= ref(x) on mask. origin_xy = (x0, y0) = (column, row) of the crop s top-left pixel."""
-  ref, other = to_gray(ref), to_gray(other)
-  norm = norm or CoordNorm.from_shape(ref.shape)
-  theta = np.zeros(8) if theta0 is None else np.array(theta0, np.float64).copy()
-  if init_translation and model != "translation":
-    theta = gauss_newton(ref, other, theta, "translation", mask, norm, origin_xy, levels, iters, False)
-  idx = MODEL_INDICIES[model]
-  if levels is None:
-    levels = _n_levels(ref.shape)
-  # image pyramid (mask pyramid)
-  pr, po = [ref], [other]
-  for _ in range(levels):
-    pr.append(cv2.pyrDown(pr[-1]))
-    po.append(cv2.pyrDown(po[-1]))
-  pm = None
-  if mask is not None:
-    pm = [mask.astype(np.float32)]
-    for l in range(1, levels + 1):
-      pm.append(cv2.resize(pm[-1], (pr[l].shape[1], pr[l].shape[0]),
-        interpolation=cv2.INTER_LINEAR
-      ))
-  for lvl in range(levels, -1, -1): # coarse -> fine
-    sc = float(2 ** lvl)
-    R, O = pr[lvl], po[lvl]
-    h, w = R.shape
-    gx = cv2.Sobel(O, cv2.CV_32F, 1, 0, ksize=3) / 8.0
-    gy = cv2.Sobel(O, cv2.CV_32F, 0, 1, ksize=3) / 8.0
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    xn = (xs * sc + origin_xy[0] - norm.cx) / norm.s  # full-image coords
-    yn = (ys * sc + origin_xy[1] - norm.cy) / norm.s
-    bu, bv = _flow_jacobian(xn.astype(np.float64), yn.astype(np.float64))
-    sel = np.ones((h, w), bool) if pm is None else pm[lvl] > 0.5
-    sel[:1, :] = sel[-1:, :] = False
-    sel[:, :1] = sel[:, -1:] = False
-    if sel.sum() < 4 * len(idx): continue
-    for it in range(iters):
-      u = (bu @ theta) / sc # flow at this level
-      v = (bv @ theta) / sc
-      mx, my = (xs + u).astype(np.float32), (ys + v).astype(np.float32)
-      Iw  = cv2.remap(O, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-      gxw = cv2.remap(gx, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-      gyw = cv2.remap(gy, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-      act = sel & (mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)
-      if act.sum() < 4 * len(idx): break
-      e = (Iw - R)[act].astype(np.float64)
-      J = (gxw[act][:, None] * bu[act][:, idx] + gyw[act][:, None] * bv[act][:, idx]) / sc
-      sigma = max(1.4826 * np.median(np.abs(e)), 2e-3)
-      if it < 3 or lvl == levels:
-        c = 1.345 * sigma
-        wgt = np.minimum(1.0, c / np.maximum(np.abs(e), 1e-12))
-      else:
-        c = 4.685 * sigma
-        r = np.abs(e) / c
-        wgt = np.where(r < 1, (1 - r * r) ** 2, 0.0)
-      Jw = J * wgt[:, None]
-      A = Jw.T @ J
-      A += np.eye(len(idx)) * (1e-9 + 1e-6 * np.trace(A) / len(idx))
-      delta = np.linalg.solve(A, -Jw.T @ e)
-      theta[idx] += delta
-      if np.max(np.abs(delta)) < 1e-3 * sc: break
-  return theta
+def downsample_mask(mask: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+  return F.interpolate(mask.float(), size=shape, mode="area")
 
-def correlation_shift(ref, other):
-  a, b = to_gray(ref), to_gray(other)
-  win = cv2.createHanningWindow((a.shape[1], a.shape[0]), cv2.CV_32F)
-  (dx, dy), _ = cv2.phaseCorrelate(a, b, win)
-  return dx, dy
+# -------------------------- Coordinates --------------------------
+def normalized_grid(H: int, W: int, device, dtype=torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
+  ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+  xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+  Y, X = torch.meshgrid(ys, xs, indexing="ij")
+  return X, Y
 
-def dominant_motion(ref, other, norm=None):
- """Pseudocode step 1-2: dominant quadratic motion ref -> other"""
- norm = norm or CoordNorm.from_shape(ref.shape)
- dx, dy = correlation_shift(ref, other)
- theta0 = np.array([dx, 0, 0, dy, 0, 0, 0, 0], np.float64)
- return gauss_newton(ref, other, theta0, "quadratic", norm=norm)
 
-# -----------------------------------------------
-# Misalignment
-# -----------------------------------------------
-def misalignment_map(ref,warped, win=7, noise=0.01, measure="normal_flow"):
-  """normal_flow: residual displacement in pixels (threshold ~1.0)
-  intensity: |I_ref - I_warped| in grey levels (threshold ~6)"""
-  a = cv2.GaussianBlur(to_gray(ref), (0,0), 1.0)
-  b = cv2.GaussianBlur(to_gray(warped), (0,0), 1.0)
-  it = b - a
-  if measure == "intensity":
-    return cv2.boxFilter(np.abs(it), -1, (win, win)) * 255.0
-  m = 0.5 * (a + b)
-  gx = cv2.Sobel(m, cv2.CV_32F, 1, 0, ksize=3) / 8.0
-  gy = cv2.Sobel(m, cv2.CV_32F, 0, 1, ksize=3) / 8.0
-  num = cv2.boxFilter(it * it, -1, (win, win))
-  den = cv2.boxFilter(gx * gx + gy * gy, -1, (win, win))
-  return np.sqrt(np.maximum(num, 0) / (np.maximum(den, 0) + (3 * noise) ** 2))
+def pixel_grid(H: int, W: int, device, dtype=torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
+  ys = torch.arange(H, device=device, dtype=dtype)
+  xs = torch.arange(W, device=device, dtype=dtype)
+  Y, X = torch.meshgrid(ys, xs, indexing="ij")
+  return X, Y
 
-# -----------------------------------------------
-# Second alignment per misaligned region
-# -----------------------------------------------
-@dataclass
-class Layer:
-  mask: np.ndarray # boll, full ref frame
-  theta_k: np.ndarray # 2nd motion ref -> k
-  theta_j: np.ndarray # 2nd motion ref -> j
-  model: str
-  area: int = 0
-  parallax: float = 0.0 # median |mu|
-  score: float = 0.0 # mean rigidity score
-  moving: bool = False
 
-def _sub_model(area):
-  """Simplier model for smaller region (fewer pixels -> fewer params)"""
-  if area < 1200:
-    return "translation"
-  if area < 15000:
-    return "affine"
-  return "quadratic"
+def warp_by_flow(img: torch.Tensor, flow: torch.Tensor, padding: str = "border") -> torch.Tensor:
+  """Sample img at x + flow(x). flow: (B,2,H,W) in pixels."""
+  _, _, H, W = img.shape
+  X, Y = pixel_grid(H, W, img.device, img.dtype)
+  gx = (X + flow[:, 0]) * (2.0 / max(W - 1, 1)) - 1.0
+  gy = (Y + flow[:, 1]) * (2.0 / max(H - 1, 1)) - 1.0
+  grid = torch.stack([gx, gy], dim=-1)
+  return F.grid_sample(img, grid, mode="bilinear", padding_mode=padding, align_corners=True)
 
-def second_alignment(I_ref, I_k, I_j, mis_ref, th1_k,th1_j, norm, thresh, measure="normal_flow",
-                     min_area=60, max_layers_per_region=3, margin=40, min_inlier_frac=0.25):
-  """For every misaligned region fit a 2nd 2D parametric motion (started from
-  the dominant one), keep the pixels it aligns, repeat on what is left"""
-  R, K, J = to_gray(I_ref), to_gray(I_k), to_gray(I_j)
-  H, W = R.shape
-  layers = []
-  n, lab, stats, _ = cv2.connectedComponentsWithStats(mis_ref.astype(np.uint8), connectivity=8)
-  for c in range(1, n):
-    x, y, bw, bh, area = stats[c]
-    if area < min_area: continue
-    x0, y0 = max(0, x - margin), max(0, y - margin)
-    x1, y1 = min(W, x + bw + margin), min(H, y + bh + margin)
-    Rc, Kc, Jc = R[y0:y1, x0:x1], K[y0:y1, x0:x1], J[y0:y1, x0:x1]
-    support = lab[y0:y1, x0:x1] == c
-    lv = _n_levels(Rc.shape, min_size=16, max_levels=3)
-    for _ in range(max_layers_per_region):
-      s_area = int(support.sum())
-      if s_area < min_area: break
-      model = _sub_model(s_area)
-      th2_k = gauss_newton(Rc, Kc, th1_k, model, support, norm, origin_xy=(x0,y0), levels=lv)
-      th2_j = gauss_newton(Rc, Jc, th1_j, model, support, norm, origin_xy=(x0,y0), levels=lv)
-      wk, _ = backward_warp(Kc, *model_flow_field(th2_k, Rc.shape, norm, origin_xy=(x0,y0)))
-      wj, _ = backward_warp(Jc, *model_flow_field(th2_j, Rc.shape, norm, origin_xy=(x0,y0)))
-      rk = misalignment_map(Rc, wk, measure=measure)
-      rj = misalignment_map(Rc, wj, measure=measure)
-      inl = support & (rk < thresh) & (rj < thresh)
-      inl = clean_mask(inl, open_px=3, close_px=5, min_area=min_area // 2)
-      if inl.sum() < max(min_area, min_inlier_frac * s_area): break
-      full = np.zeros((H, W), bool)
-      full[y0:y1, x0:x1] = inl
-      layers.append(Layer(full, th2_k, th2_j, model, int(inl.sum())))
-      support = clean_mask(support & ~inl, open_px=3, close_px=3, min_area=min_area)
-  return layers
 
-# -----------------------------------------------
-# Parallax
-# -----------------------------------------------
-def parallax(theta2, theta1, x, y, norm):
-  """mu = [u2, v2] - [u1, v1] at pixels (x, y): 2nd layer flow minus dominant flow"""
-  u2, v2 = eval_flow(theta2, x, y, norm)
-  u1, v1 = eval_flow(theta1, x, y, norm)
-  return np.stack([u2 - u1, v2 - v1], -1)
+def flow_valid(flow: torch.Tensor) -> torch.Tensor:
+  _, _, H, W = flow.shape
+  X, Y = pixel_grid(H, W, flow.device, flow.dtype)
+  x = X + flow[:, 0]
+  y = Y + flow[:, 1]
+  return ((x >= 0) & (x <= W - 1) & (y >= 0) & (y <= H - 1))[:, None]
 
-# -----------------------------------------------
-# Parallax-based rigidity constraint
-# -----------------------------------------------
-def _perp(v):
-  return np.stack([-v[..., 1], v[..., 0]], -1)
 
-def rigidity_inconsistency(p1, mu1k, mu1j, p2, mu2k, mu2j, noise_px=0.3):
-  """Point p2 against a static reference point p1.
-  With p_w = p + mu (position after the plane alignment) and dpw = pw2 - pw1:
-    a = mu2k . dpw_k_perp   b = mu1k . dpw_k_perp
-    c = mu2j . dpw_j_perp   d = mu1j . dpw_j_perp
-  A static point satisfies  a/b = c/d,  i.e.  a*d - c*b = 0.
-  Returns (score in [0, 1], raw a*d - c*b).  tau keeps the score near 0 when the parallax is at noise level."""
-  dk = (p2 + mu2k) - (p1 + mu1k)
-  dj = (p2 + mu2j) - (p1 + mu1j)
-  a = (mu2k * _perp(dk)).sum(-1)
-  b = (mu1k * _perp(dk)).sum(-1)
-  c = (mu2j * _perp(dj)).sum(-1)
-  d = (mu1j * _perp(dj)).sum(-1)
-  raw = a * d - c * b
-  tau = noise_px ** 2 * np.linalg.norm(dk, axis=-1) * np.linalg.norm(dj, axis=-1)
-  score = np.abs(raw) / (np.abs(a * d) + np.abs(c * b) + tau + 1e-12)
-  return score, raw
-
-# -----------------------------------------------
-# Full pipeline
-# -----------------------------------------------
-@dataclass
-class MOD:
-  mask: np.ndarray # I_motion (bool, ref frame)
-  mask_2d: np.ndarray
-  mis_ref: np.ndarray # I_ref^misaligned
-  theta1_k: np.ndarray
-  theta1_j: np.ndarray
-  layers: list = field(default_factory=list)
-  ref_points: np.ndarray | None = None
-  score_map: np.ndarray | None = None
-  mode: str = ""
-
-def detect_motion(I_k, I_ref, I_j, ref_point=None, thresh: float = 1.0, score_thresh: float = 0.25, consensus_thresh: float = 0.1,
-                  plane_tol: float = 0.75, measure: str = "normal_flow", min_area: int = 60, max_layers_per_region: int = 3, n_refs: int = 15, seed: int = 0) -> MOD:
-  R = to_gray(I_ref)
-  H, W = R.shape
-  norm = CoordNorm.from_shape(R.shape)
-
-  # 1-2: Dominant 2D parametric motion (ref -> k, ref -> j)
-  th1_k = dominant_motion(R, I_k, norm)
-  th1_j = dominant_motion(R, I_j, norm)
-
-  # 3-4: Align and find the misaligned areas
-  Wk, vk = align_frame(I_k, th1_k, norm, R.shape)
-  Wj, vj = align_frame(I_j, th1_j, norm, R.shape)
-  mis_k = (misalignment_map(R, Wk, measure=measure) > thresh) & vk
-  mis_j = (misalignment_map(R, Wj, measure=measure) > thresh) & vj
-  mis_ref = clean_mask(mis_k & mis_j, min_area=min_area)
-  mask_2d = fill_holes(mis_ref)
-
-  # 5-6: Second alignment on the misaligned areas
-  layers = second_alignment(R, I_k, I_j, mis_ref, th1_k, th1_j, norm, thresh, measure, min_area, max_layers_per_region)
-
-  # 7: Parallax per layer (sampled pixels for speed)
-  rng = np.random.default_rng(seed)
-  samples = []
-  for L in layers:
-    ys, xs = np.nonzero(L.mask)
-    pick = rng.choice(len(xs), size=min(400, len(xs)), replace=False)
-    pts = np.stack([xs[pick], ys[pick]], -1).astype(np.float64)
-    muk = parallax(L.theta_k, th1_k, pts[:, 0], pts[:, 1], norm)
-    muj = parallax(L.theta_j, th1_j, pts[:, 0], pts[:, 1], norm)
-    L.parallax = float(np.median(np.maximum(np.linalg.norm(muk, axis=1), np.linalg.norm(muj, axis=1))))
-    samples.append((pts, muk, muj))
-
-  cand = [i for i, L in enumerate(layers) if L.parallax > plane_tol]
-
-  def point_mu(i, p):
-    L = layers[i]
-    return (parallax(L.theta_k, th1_k, p[0], p[1], norm),
-            parallax(L.theta_j, th1_j, p[0], p[1], norm))
-
-  def layer_score(i_ref, p_ref, i):
-    m1k, m1j = point_mu(i_ref, p_ref)
-    pts, muk, muj = samples[i]
-    s, _ = rigidity_inconsistency(np.asarray(p_ref, float), m1k, m1j, pts, muk, muj)
-    return s
-
-  def representative(i):
-    pts = samples[i][0]
-    return np.median(pts, axis=0)
-
-  # 8: A point known to be static
-  mode = "parallax"
-  if ref_point is not None:
-    x, y = round(ref_point[0]), round(ref_point[1])
-    owner = [i for i, L in enumerate(layers) if L.mask[min(max(y, 0), H - 1), min(max(x, 0), W - 1)]]
-    if not owner:
-      best, owner = None, []
-      for i in cand:
-        ys, xs = np.nonzero(layers[i].mask)
-        d = np.min((xs - x) ** 2 + (ys - y) ** 2)
-        if best is None or d < best:
-          best, owner = d, [i]
-    if not owner:
-      raise ValueError("ref_point: no misaligned region w/ parallax near this point")
-    ref_layers = owner
-    refs = [(owner[0], np.array([x, y], float))]
-  elif len(cand) < 2:
-    # Nothing to compare w/: no static point w/ parallax can be established,
-    # so the scene is treated as 2D (every misaligned area moves)
-    mode = "2d-fallback"
-    ref_layers, refs = [], []
-  else:
-    # consensus: the candidate that is strictly consistent (score below
-    # consensus_thresh) with the largest misaligned area is the static anchor
-    best_i, best_area = None, -1
-    for i in cand:
-      p = representative(i)
-      area = sum(layers[i].area for j in cand if np.median(layer_score(i, p, j)) < consensus_thresh)
-      if area > best_area:
-        best_i, best_area = i, area
-    p = representative(best_i)
-    ref_layers = [i for i in cand if np.median(layer_score(best_i, p, i)) < consensus_thresh]
-    # one re-selection round: keep the layers that agree w/ the whole set
-    refs = [(j, representative(j)) for j in ref_layers][:n_refs]
-    med = {j: np.median(np.median(np.stack([layer_score(ir, pr, j) for ir, pr in refs]), axis=0)) for j in cand}
-    ref_layers = [j for j in cand if med[j] < consensus_thresh] or [best_i]
-    refs = [(j, representative(j)) for j in ref_layers][:n_refs]
-
-  # 9: Rigidity test against the static reference point(s)
-  score_map = np.zeros((H, W), np.float32)
-  for i, L in enumerate(layers):
-    if mode == "2d-fallback":
-      L.score, L.moving = 1.0, True
-      continue
-    if L.parallax <= plane_tol: # aligned by the dominant motion
-      L.score, L.moving = 0.0, False
-      continue
-    s = np.median(np.stack([layer_score(ir, pr, i) for ir, pr in refs]), axis=0)
-    L.score = float(np.median(s))
-    L.moving = L.score > score_thresh # "!= 0" with a tolerance
-    score_map[L.mask] = L.score
-
-  if mode == "2d-fallback":
-    mask = mask_2d
-  else:
-    moving = np.zeros((H, W), bool)
-    for L in layers:
-      if L.moving:
-        moving |= L.mask
-    mask = fill_holes(clean_mask(moving, min_area=min_area))
-  ref_pts = np.array([pr for _, pr in refs], float) if refs else None
-  return MOD(mask, mask_2d, mis_ref, th1_k, th1_j, layers, ref_pts, score_map, mode)
+def border_mask(H: int, W: int, margin: int, device) -> torch.Tensor:
+  m = torch.zeros(1, 1, H, W, dtype=torch.bool, device=device)
+  m[..., margin:H - margin, margin:W - margin] = True
+  return m
