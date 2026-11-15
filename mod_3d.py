@@ -25,6 +25,8 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 
 import cv2
+from mpmath.function_docs import e1
+from mpmath.libmp.libmpf import sage
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -55,14 +57,12 @@ def get_device(prefer: str | None = None) -> torch.device:
       return torch.device("mps")
   return torch.device("cpu")
 
-def frame_to_tensor(frame, device: torch.device) -> torch.Tensor:
-  """uint8 HxW or HxWx3 (RGB or BGR - luminance weights are near-symmetric) -> (1,1,H,W) float"""
-  t = torch.as_tensor(frame, device=device)
+def frame_to_tensor(frame: np.ndarray, device: torch.device, bgr: bool = True) -> torch.Tensor:
+  """uint8 HxW or HxWx3 -> (1, 1, H, W) float luminance in [0, 1]."""
+  t = torch.as_tensor(frame, device=device, dtype=torch.float32)
   if t.ndim == 3:
-      t = t.float()
-      t = 0.299 * t[..., 0] + 0.587 * t[..., 1] + 0.114 * t[..., 2]
-  else:
-      t = t.float()
+    w0, w2 = (0.114, 0.299) if bgr else (0.299, 0.114)
+    t = w0 * t[..., 0] + 0.587 * t[..., 1] + w2 * t[..., 2]
   return (t / 255.0)[None, None]
 
 # -------------------------- Filtering --------------------------
@@ -85,8 +85,7 @@ def gauss_blur(img: torch.Tensor, sigma: float) -> torch.Tensor:
   out = F.pad(img, (r, r, 0, 0), mode="replicate")
   out = F.conv2d(out, kx, groups=C)
   out = F.pad(out, (0, 0, r, r), mode="replicate")
-  out = F.conv2d(out, ky, groups=C)
-  return out
+  return F.conv2d(out, ky, groups=C)
 
 def box_filter(img: torch.Tensor, radius: int) -> torch.Tensor:
   """Mean over a (2r+1)^2 window; borders use only valid pixels"""
@@ -103,19 +102,17 @@ def grad(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
   return gx, gy
 
 def median_filter3(x: torch.Tensor) -> torch.Tensor:
-  """3x3 median filter (per channel)"""
+  """3x3 median filter (per channel)."""
   B, C, H, W = x.shape
   p = F.pad(x, (1, 1, 1, 1), mode="replicate")
-  patches = F.unfold(p, 3) # (B, C*9, H*W)
-  patches = patches.view(B, C, 9, H * W)
+  patches = F.unfold(p, 3).view(B, C, 9, H * W)
   return patches.median(dim=2).values.view(B, C, H, W)
 
 def dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
   """Dilate a binary mask by a given radius (in pixels)"""
   if radius <= 0:
     return mask
-  m = mask.float()
-  return F.max_pool2d(m, 2 * radius + 1, stride=1, padding=radius) > 0.5
+  return F.max_pool2d(mask.float(), 2 * radius + 1, stride=1, padding=radius) > 0.5
 
 def erode(mask: torch.Tensor, radius: int) -> torch.Tensor:
   if radius <= 0:
@@ -136,7 +133,7 @@ def build_pyramid(img: torch.Tensor, levels: int, kind: str = "gaussian") -> lis
   if kind == "laplacian":
     pyr = [p - gauss_blur(p, 2.0) for p in pyr]
   elif kind != "gaussian":
-    raise ValueError(kind)
+    raise ValueError(f"Unknown pyramid kind: {kind!r}")
   return pyr
 
 def auto_levels(H: int, W: int, min_size: int = 24, max_levels: int = 6) -> int:
@@ -155,13 +152,11 @@ def norm_grid(H: int, W: int, device, dtype=torch.float32) -> tuple[torch.Tensor
   Y, X = torch.meshgrid(ys, xs, indexing="ij")
   return X, Y
 
-
 def pixel_grid(H: int, W: int, device, dtype=torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
   ys = torch.arange(H, device=device, dtype=dtype)
   xs = torch.arange(W, device=device, dtype=dtype)
   Y, X = torch.meshgrid(ys, xs, indexing="ij")
   return X, Y
-
 
 def warp_by_flow(img: torch.Tensor, flow: torch.Tensor, padding: str = "border") -> torch.Tensor:
   """Sample img at x + flow(x). flow: (B,2,H,W) in pixels."""
@@ -172,7 +167,6 @@ def warp_by_flow(img: torch.Tensor, flow: torch.Tensor, padding: str = "border")
   grid = torch.stack([gx, gy], dim=-1)
   return F.grid_sample(img, grid, mode="bilinear", padding_mode=padding, align_corners=True)
 
-
 def flow_valid(flow: torch.Tensor) -> torch.Tensor:
   _, _, H, W = flow.shape
   X, Y = pixel_grid(H, W, flow.device, flow.dtype)
@@ -180,16 +174,19 @@ def flow_valid(flow: torch.Tensor) -> torch.Tensor:
   y = Y + flow[:, 1]
   return ((x >= 0) & (x <= W - 1) & (y >= 0) & (y <= H - 1))[:, None]
 
-
 def border_mask(H: int, W: int, margin: int, device) -> torch.Tensor:
   m = torch.zeros(1, 1, H, W, dtype=torch.bool, device=device)
-  m[..., margin:H - margin, margin:W - margin] = True
+  if margin > 0 and H > 2 * margin and W > 2 * margin:
+    m[..., margin : H - margin, margin : W - margin] = True
+  else:
+    m.fill_(True)
   return m
 
 # ============================================================
 # 2. 2D PARAMETRIC MOTION + DOMINANT-MOTION INITIALIZATION
 # ===========================================================
 MODELS = {"translation", "affine", "quadratic", "homography"}
+
 # indices into the 8-vector for each model family
 #   quadratic : (a, b, c, d, e, f, g, h)      as in Eq. (2)
 #   homography: H = I + [[p0 p1 p2],[p3 p4 p5],[p6 p7 0]]
@@ -208,6 +205,10 @@ def _family(model: str) -> str:
 def _max_stage(model: str) -> str:
   return {"translation": "translation", "affine": "affine"}.get(model, "full")
 
+def _safe_denom(D: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+  sign = torch.where(D >= 0, torch.ones_like(D), -torch.ones_like(D))
+  return torch.where(D.abs() < eps, sign * eps, D)
+
 # -------------------------- Model Evaluation --------------------------
 def apply_model(p: torch.Tensor, model: str, X: torch.Tensor, Y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
   """Warp normalized coords (H,W) by params p(B,8) -> (B,H,W) x', y'"""
@@ -219,12 +220,13 @@ def apply_model(p: torch.Tensor, model: str, X: torch.Tensor, Y: torch.Tensor) -
     v = d + e * X + f * Y + g * X * Y + h * Y * Y
     return X + u, Y + v
   # homography
-  D = P[6] * X + P[7] * Y + 1.0
+  D = _safe_denom(P[6] * X + P[7] * Y + 1.0)
   Nx = (1.0 + P[0]) * X + P[1] * Y + P[2]
   Ny = P[3] * X + (1.0 + P[4]) * Y + P[5]
   return Nx / D, Ny / D
 
 def model_jacobian(p: torch.Tensor, model: str, X: torch.Tensor, Y:  torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+  """dx'/dp and dy'/dp, each (B,8,H,W)"""
   B = p.shape[0]
   H, W = X.shape
   fam = _family(model)
@@ -235,7 +237,7 @@ def model_jacobian(p: torch.Tensor, model: str, X: torch.Tensor, Y:  torch.Tenso
     JY = torch.stack([zero, zero, zero, one, X, Y, X * Y, Y * Y])
     return JX.unsqueeze(0).expand(B, -1, -1, -1), JY.unsqueeze(0).expand(B, -1, -1, -1)
   xw, yw = apply_model(p, model, X, Y)
-  D = p[:, 6].view(-1, 1, 1) * X + p[:, 7].view(-1, 1, 1) * Y + 1.0
+  D = _safe_denom(p[:, 6].view(-1, 1, 1) * X + p[:, 7].view(-1, 1, 1) * Y + 1.0)
   iD = 1.0 / D
   Xb, Yb = X.expand(B, H, W), Y.expand(B, H, W)
   z = torch.zeros_like(xw)
@@ -359,8 +361,7 @@ def est_param(ref: torch.Tensor, insp: torch.Tensor, cfg: ParamConfig = ParamCon
 # -------------------------- Initialization --------------------------
 @torch.no_grad()
 def phase_corr_peaks(ref: torch.Tensor, insp: torch.Tensor, k: int = 3, nms: int = 6) -> torch.Tensor:
-  """Top-k global translation hypotheses d (pixels) with insp(x + d) ~= ref(x),
-  from the phase-correlation surface (GPU FFT).  Returns (B, k, 2)."""
+  """Top-k global translation hypotheses d (pixels) via GPU FFT phase correlation."""
   B, _, H, W = insp.shape
   if ref.shape[0] == 1 and B > 1:
     ref = ref.expand(B, -1, -1, -1)
@@ -426,7 +427,127 @@ def norm_flow_misalign(ref: torch.Tensor, warped: torch.Tensor, radius: int = 2,
   tex = box_filter(g2, radius)
   return num / (tex + eps), tex
 
-def misalignment_mask(M: torch.Tensor, texture: torch.Tensor, valid: torch.Tensor,
-                      thr: float = 0.5, tex_thr: float = 2e-4) -> torch.Tensor:
-    """Boolean mask of misaligned (moving or parallax) pixels."""
-    return (M > thr) & (texture > tex_thr) & valid.bool()
+def misalign_mask(M: torch.Tensor, texture: torch.Tensor, valid: torch.Tensor,
+                  thr: float = 0.5, tex_thr: float = 2e-4) -> torch.Tensor:
+  """Boolean mask of misaligned (moving or parallax) pixels."""
+  return (M > thr) & (texture > tex_thr) & valid.bool()
+
+# ============================================================
+# 4. DENSE PLANAR-PARALLAX FLOW
+# ============================================================
+def _shift(img: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
+  """out(x, y) = img(x + dx, y + dy) with replicate border."""
+  if dx == 0 and dy == 0:
+    return img
+  r = max(abs(dx), abs(dy))
+  p = F.pad(img, (r, r, r, r), mode="replicate")
+  H, W = img.shape[-2:]
+  return p[..., r + dy:r + dy + H, r + dx:r + dx + W]
+
+def _win_offset(radius: int, device, dtype):
+  offs, wts = [], []
+  sig = max(radius / 1.5, 0.5)
+  for dy in range(-radius, radius + 1):
+    for dx in range(-radius, radius + 1):
+      offs.append((dx, dy))
+      wts.append(math.exp(-0.5 * (dx * dx + dy * dy) / sig ** 2))
+  w = torch.tensor(wts, device=device, dtype=dtype)
+  return offs, w / w.sum()
+
+@torch.no_grad()
+def _lk_lvl(R: torch.Tensor, I: torch.Tensor, flow: torch.Tensor, radius: int,
+            iters: int, lam: float, max_step: float, median: bool, chunk: int=7):
+  B, _, H, W = R.shape
+  offs, wts = _win_offset(radius, R.device, R.dtype)
+  gx, gy = grad(R)
+  Rn = torch.cat([_shift(R, dx, dy) for dx, dy in offs], dim=1)
+  Gxn = torch.cat([_shift(gx, dx, dy) for dx, dy in offs], dim=1)
+  Gyn = torch.cat([_shift(gy, dx, dy) for dx, dy in offs], dim=1)
+  w_view = wts.view(1, -1, 1, 1)
+  Sxx = (w_view * Gxn * Gxn).sum(dim=1, keepdim=True)
+  Syy = (w_view * Gyn * Gyn).sum(dim=1, keepdim=True)
+  Sxy = (w_view * Gxn * Gyn).sum(dim=1, keepdim=True)
+  lamb = lam * 0.5 * (Sxx + Syy).mean(dim=(1, 2, 3), keepdim=True) + 1e-12
+  Axx, Ayy = Sxx + lamb, Syy + lamb
+  det = Axx * Ayy - Sxy * Sxy
+  X, Y = pixel_grid(H, W, R.device, R.dtype)
+  sx, sy = 2.0 / max(W - 1, 1), 2.0 / max(H - 1, 1)
+  n_off = len(offs)
+
+  for _ in range(iters):
+    bx = torch.zeros_like(R)
+    by = torch.zeros_like(R)
+    base_x = X + flow[:,0]
+    base_y = Y + flow[:,1]
+    for s in range(0, n_off, chunk):
+      e = min(s + chunk, n_off)
+      idx = range(s, e)
+      gxs = torch.cat([(base_x + offs[i][0]) * sx - 1.0 for i in idx], 1)   # (B, c*H, W)
+      gys = torch.cat([(base_y + offs[i][1]) * sy - 1.0 for i in idx], 1)
+      grid = torch.stack([gxs, gys], dim=-1)
+      samp = F.grid_sample(I, grid, mode="bilinear", padding_mode="border", align_corners=True)
+      samp = samp.view(B, len(idx), H, W)
+      It = samp - Rn[:, s:e]
+      wc = w_view[:, s:e]
+      bx = bx + (wc * Gxn[:, s:e] * It).sum(dim=1, keepdim=True)
+      by = by + (wc * Gyn[:, s:e] * It).sum(dim=1, keepdim=True)
+    du = -(Ayy * bx - Sxy * by) / det
+    dv = -(Axx * by - Sxy * bx) / det
+    flow = flow + torch.cat([du, dv], 1).clamp(-max_step, max_step)
+    if median:
+      flow = median_filter3(flow)
+  conf = 0.5 * (Sxx + Syy - torch.sqrt(torch.clamp((Sxx - Syy) ** 2 + 4 * Sxy ** 2, min=0)))
+  return flow, conf
+
+@torch.no_grad()
+def _block_search(R: torch.Tensor, I: torch.Tensor, flow: torch.Tensor, s: int, radius: int) -> torch.Tensor:
+  """Interger-displacement search around ``flow`` minimizing windowed SAD"""
+  best = None
+  best_d = torch.zeros_like(flow)
+  for dy in range(-s, s + 1):
+    for dx in range (-s, s + 1):
+      d = torch.tensor([dx, dy], device=R.device, dtype=R.dtype).view(1, 2, 1, 1)
+      Iw = warp_by_flow(I, flow + d)
+      c = box_filter((Iw - R).abs(), radius) + 1e-4 * (dx * dx + dy * dy)
+      if best is None:
+        best = c
+        best_d = d.expand_as(flow).clone()
+      else:
+        better = c < best
+        best = torch.where(better, c, best)
+        best_d = torch.where(better.expand_as(flow), d.expand_as(flow), best_d)
+  return flow + best_d
+
+@torch.no_grad()
+def dense_lk(ref: torch.Tensor, insp: torch.Tensor, init: torch.Tensor | None = None, levels: int | None = None,
+             iters: int = 6, radius: int = 3, max_step: float = 2.0, median: bool = True, min_size: int = 20,
+             search: int = 3, lam: float = 0.02) -> tuple[torch.Tensor, torch.Tensor]:
+  """Flow mu such that insp(x + mu(x)) ~= ref(x)"""
+  B = insp.shape[0]
+  if ref.shape[0] == 1 and B > 1:
+    ref = ref.expand(B, -1, -1, -1)
+  H, W = ref.shape[-2:]
+  L = auto_levels(H, W, min_size=min_size, max_levels=5) if levels is None else levels
+  if L < 1:
+    raise ValueError(f"levels must be >= 1, got {L}")
+  pr = build_pyramid(gauss_blur(ref, 0.7), L)
+  pi = build_pyramid(gauss_blur(insp, 0.7), L)
+
+  # Coarsest level initialization
+  R, I = pr[L - 1], pi[L - 1]
+  h, w = R.shape[-2:]
+  if init is not None:
+    flow = F.interpolate(init, size=(h, w), mode="bilinear", align_corners=True) / (2 ** (L - 1))
+  else:
+    flow = torch.zeros(B, 2, h, w, device=R.device, dtype=R.dtype)
+  if search > 0:
+    flow = _block_search(R, I, flow, search, radius)
+  flow, conf = _lk_lvl(R, I, flow, radius, iters, lam, max_step, median)
+
+  # Remaining finer levels
+  for lvl in range(L - 2, -1, -1):
+    R, I = pr[lvl], pi[lvl]
+    h, w = R.shape[-2:]
+    flow = 2.0 * F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=True)
+    flow, conf = _lk_lvl(R, I, flow, radius, iters, lam, max_step, median)
+  return flow, conf
