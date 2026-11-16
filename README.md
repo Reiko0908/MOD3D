@@ -60,21 +60,21 @@ After compensating for planar motion, the remaining displacement contains inform
 
 The key observation is that static 3D points must satisfy a common projective structure constraint across three views, consisting of a reference image $I$ and two inspection images $I_j$ and $I_k$.
 
-Consider two image points $\vec{p}_1$ and $\vec{p}_2$, with relative image separation:
+Consider two image points $\mathbf{p}_1$ and $\mathbf{p}_2$, with relative image separation:
 
 $$
-\Delta\vec{p}_w = \vec{p}_2 - \vec{p}_1
+\Delta\mathbf{p}_w = \mathbf{p}_2 - \mathbf{p}_1
 $$
 
-Let $`\vec{\mu}_1^{\,j}`$ and $`\vec{\mu}_2^{\,j}`$ denote their residual parallax vectors in inspection view $j$, with corresponding vectors in view $k$.
+Let $\boldsymbol{\mu}_1^{\,j}$ and $\boldsymbol{\mu}_2^{\,j}$ denote their residual parallax vectors in inspection view $j$, with corresponding vectors in view $k$.
 
 For static 3D points, the following three-frame parallax rigidity constraint must hold [1]:
 
 $$
-\frac{\vec{\mu}_2^{j,T} (\Delta\vec{p}_w)^j_{\perp}}{\vec{\mu}_1^{j,T} (\Delta\vec{p}_w)^j_{\perp}} - \frac{\vec{\mu}_2^{k,T} (\Delta\vec{p}_w)^k_{\perp}}{\vec{\mu}_1^{k,T} (\Delta\vec{p}_w)^k_{\perp}} = 0
+\frac{\boldsymbol{\mu}_2^{j,T} (\Delta\mathbf{p}_w)^j_{\perp}}{\boldsymbol{\mu}_1^{j,T} (\Delta\mathbf{p}_w)^j_{\perp}} - \frac{\boldsymbol{\mu}_2^{k,T} (\Delta\mathbf{p}_w)^k_{\perp}}{\boldsymbol{\mu}_1^{k,T} (\Delta\mathbf{p}_w)^k_{\perp}} = 0
 $$
 
-Here, $`\Delta\,\vec{p}_{w,\perp}^{j}`$ and $`\Delta\,\vec{p}_{w,\perp}^{k}`$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
+Here, $`(\Delta\mathbf{p}_w)^j_{\perp}`$ and $`(\Delta\mathbf{p}_w)^k_{\perp}`$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
 
 The constraint measures the consistency of relative parallax across the two inspection views. Points that significantly violate this constraint relative to a consensus set of static reference points provide evidence of independent 3D motion.
 
