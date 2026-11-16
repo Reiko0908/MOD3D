@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
 import cv2
+import maxflow
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -807,3 +808,227 @@ def inconsistency_map(
         out[ii] = torch.where(n >= min_refs, med, torch.zeros_like(med))
         cnt[ii] = n.float()
     return out.view(H, W), cnt.view(H, W)
+
+
+# ============================================================
+# 6. GRAPH-CUT LABELLING (Binary MRF, Max-Flow / Min-Cut)
+# ============================================================
+@dataclass
+class GraphCutConfig:
+    solver: str = "bk"  # 'dinic' (SciPy) | 'bk' (PyMaxflow)
+    thr: float = 0.6  # evidence threshold [px]
+    k: float = 2.0  # log-odds slope
+    lmax: float = 3.0  # clip of the log-odds
+    lam: float = 8.0  # smoothness weight relative to the data term
+    w0: float = 0.1  # contrast-independent pairwise weight
+    sigma: float = 0.15  # contrast sensitivity (intensity in [0, 1])
+    unknown_bias: float = 0.05  # cost of labelling an unmeasurable pixel "moving"
+    neighbours: int = 8  # 4 or 8
+    scale: int = 1000  # integer capacity scale for Dinic
+    min_area: int = 60
+    # Second pass for additional smaller moving objects
+    others: bool = True
+    others_lam: float = 4.0
+    others_thr: float = 0.5
+    others_min_area: int = 40
+    others_seed_thr: float = 1.2
+    others_seed_n: int = 12
+    others_dil: int = 8
+    others_photo: bool = True
+    others_photo_scale: float = 0.6
+    others_photo_seed: float = 3.0
+
+
+def layered_evidence(
+    r: dict[str, np.ndarray], tex_thr: float = 2e-4
+) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous layered motion evidence: misaligne w/ both plan and 2nd layer"""
+    s = np.minimum(["ev_plane"], r["ev_layer2"])
+    measurable = (
+        (r["tex_plane"] > tex_thr)
+        & (r["tex_layer2"] > tex_thr)
+        & r["valid_both"]
+        & r["valid_layer2"]
+    )
+    return s, measurable
+
+
+def rigidity_evidence(
+    r: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """3D level: rigidity inconsistency (px), eval where reliable parallax exists."""
+    m = r["inconsistency"]
+    return m, m > 0
+
+
+def log_odds(
+    s: np.ndarray,
+    measurable: np.ndarray,
+    cfg: GraphCutConfig,
+    thr: float | None = None,
+) -> np.ndarray:
+    t = cfg.thr if thr is None else thr
+    l = cfg.k * np.log(np.maximum(s, 1e-3) / max(t, 1e-6))
+    l = np.clip(l, -cfg.lmax, cfg.lmax)
+    return np.where(measurable, l, 0.0)
+
+
+class Grid:
+    """Neighbour idx arr for an HxW grid (cached per resolution"""
+
+    def __init__(self, H: int, W: int, neighbours: int = 8):
+        self.H, self.W = H, W
+        idx = np.arange(H * W).reshape(H, W)
+        pairs, dists = [], []
+        shifts = [(0, 1, 1.0), (1, 0, 1.0)] + (
+            [(1, 1, 2**0.5), (1, -1, 2**0.5)] if neighbours == 8 else []
+        )
+        for dy, dx, dist in shifts:
+            ys, yd = slice(0, H - dy), slice(dy, H)
+            if dx >= 0:
+                xs, xd = slice(0, W - dx), slice(dx, W)
+            else:
+                xs, xd = slice(-dx, W), slice(0, W + dx)
+            pairs.append((idx[ys, xs].ravel(), idx[yd, xd].ravel()))
+            dists.append(dist)
+        self.p = np.concatenate([a for a, _ in pairs])
+        self.q = np.concatenate([b for _, b in pairs])
+        self.dist = np.concatenate(
+            [np.full(len(a), d) for (a, _), d in zip(pairs, dists)]
+        )
+
+
+_GRIDS: dict[tuple[int, int, int], Grid] = {}
+
+
+def _grid(H: int, W: int, n: int) -> Grid:
+    if (H, W, n) not in _GRIDS:
+        _GRIDS[(H, W, n)] = Grid(H, W, n)
+    return _GRIDS[(H, W, n)]
+
+
+def pairwise_weights(gray: np.ndarray, cfg: GraphCutConfig) -> tuple[Grid, np.ndarray]:
+    H, W = gray.shape
+    g = _grid(H, W, cfg.neighbours)
+    I = gray.astype(np.float32).ravel() / 255.0
+    d2 = (I[g.p] - I[g.q]) ** 2
+    contrast = np.exp(-d2 / (2 * cfg.sigma**2)) if cfg.sigma > 0 else np.ones_like(d2)
+    return g, cfg.lam * (cfg.w0 + contrast) / g.dist
+
+
+def solve_binary(
+    l: np.ndarray,
+    measurable: np.ndarray,
+    gray: np.ndarray,
+    cfg: GraphCutConfig,
+    hard_static: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Minimise binary MRF energy over {static, moving} via Boykov-Kolmogorov s-t min-cut"""
+    H, W = l.shape
+    d_move = np.maximum(0.0, -l)
+    d_stat = np.maximum(0.0, l)
+    d_move = np.where(measurable, d_move, cfg.unknown_bias)
+    if hard_static is not None:
+        d_move = np.where(hard_static, 1e3, d_move)
+        d_stat = np.where(hard_static, 0.0, d_stat)
+    net = d_stat - d_move
+    src_cap = np.maximum(net, 0).ravel()
+    snk_cap = np.maximum(-net, 0).ravel()
+    g, w = pairwise_weights(gray, cfg)
+    t0 = time.perf_counter()
+
+    N = H * W
+    gr = maxflow.Graph[float](N, len(g.p))
+    gr.add_nodes(N)
+    gr.add_edges(
+        g.p.astype(np.int32),
+        g.q.astype(np.int32),
+        w.astype(np.float64),
+        w.astype(np.float64),
+    )
+    gr.add_grid_tedges(
+        np.arange(N), src_cap.astype(np.float64), snk_cap.astype(np.float64)
+    )
+    flow = gr.maxflow()
+    seg = gr.get_grid_segments(np.arange(N))
+    lab = (~seg).reshape(H, W)
+    info = {
+        "solve_s": time.perf_counter() - t0,
+        "flow": float(flow),
+        "nodes": N,
+        "edges": len(g.p),
+        "solver": "bk",
+    }
+    return lab, info
+
+
+def secondary_objects(
+    r: dict[str, np.ndarray],
+    main: np.ndarray,
+    cfg: GraphCutConfig,
+    border: int = 10,
+    tex_thr: float = 2e-4,
+) -> np.ndarray:
+    """Second graph-cut pass with weaker smoothing to recover smaller secondary moving objects."""
+    sec_cfg = replace(cfg, lam=cfg.others_lam, thr=cfg.others_thr)
+    s, meas = layered_evidence(r, tex_thr=tex_thr)
+    l = log_odds(s, meas, sec_cfg)
+    seed = (s > cfg.others_seed_thr) & meas
+    meas2 = meas
+    if cfg.others_photo and "res_plane" in r:
+        thr_ph = r["res_thr"] * cfg.others_photo_scale
+        use = (~meas) & r["res_valid"]
+        l_ph = np.clip(
+            sec_cfg.k * np.log(np.maximum(r["res_plane"], 1e-4) / thr_ph),
+            -sec_cfg.lmax,
+            sec_cfg.lmax,
+        )
+        l = np.where(use, l_ph, l)
+        meas2 = meas | use
+        seed = seed | (use & (r["res_plane"] > cfg.others_photo_seed * thr_ph))
+    H, W = l.shape
+    hard = np.ones((H, W), bool)
+    if border > 0 and H > 2 * border and W > 2 * border:
+        hard[border:-border, border:-border] = False
+    else:
+        hard.fill(False)
+    lab, _ = solve_binary(l, meas2, r["gray"], sec_cfg, hard_static=hard)
+    d = 2 * cfg.others_dil + 1
+    zone = cv2.dilate(main.astype(np.uint8), np.ones((d, d), np.uint8)) > 0
+    cand = (lab & ~zone).astype(np.uint8)
+    n, lb, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    keep = np.zeros(n, bool)
+    if n > 1:
+        mask_idx = np.asarray(seed & (cand > 0), dtype=bool)
+        cnt = np.bincount(lb[mask_idx], minlength=n)
+        keep[1:] = (st[1:, 4] >= cfg.others_min_area) & (cnt[1:] >= cfg.others_seed_n)
+    out = keep[lb].astype(np.uint8)
+    if out.any():
+        cs, _ = cv2.findContours(out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(out, cs, -1, 1, thickness=cv2.FILLED)
+    return out.astype(bool)
+
+
+def label_frame(
+    r: dict[str, np.ndarray],
+    cfg: GraphCutConfig,
+    level: str | None = None,
+    border: int = 10,
+    tex_thr: float = 2e-4,
+    rig_thr: float | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Graph-cut labelling of one frame from the detector's continuous evidence."""
+    level = level or r["level"]
+    if level == "layered":
+        s, meas = layered_evidence(r, tex_thr=tex_thr)
+        l = log_odds(s, meas, cfg)
+    else:
+        s, meas = rigidity_evidence(r)
+        l = log_odds(s, meas, cfg, thr=rig_thr or cfg.thr)
+    H, W = l.shape
+    hard = np.ones((H, W), bool)
+    if border > 0 and H > 2 * border and W > 2 * border:
+        hard[border:-border, border:-border] = False
+    else:
+        hard.fill(False)
+    return solve_binary(l, meas, r["gray"], cfg, hard_static=hard)
