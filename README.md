@@ -74,7 +74,7 @@ $$
 \frac{\vec{\mu}_2^{j,T} (\Delta\vec{p}_w)^j_{\perp}}{\vec{\mu}_1^{j,T} (\Delta\vec{p}_w)^j_{\perp}} - \frac{\vec{\mu}_2^{k,T} (\Delta\vec{p}_w)^k_{\perp}}{\vec{\mu}_1^{k,T} (\Delta\vec{p}_w)^k_{\perp}} = 0
 $$
 
-Here, $\Delta\vec{p}_{w,\perp}^{j} \text{ and } \Delta\vec{p}_{w,\perp}^{k}$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
+Here, $`\Delta\vec{p}_{w,\perp}^{j}`$ and $`\Delta\vec{p}_{w,\perp}^{k}`$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
 
 The constraint measures the consistency of relative parallax across the two inspection views. Points that significantly violate this constraint relative to a consensus set of static reference points provide evidence of independent 3D motion.
 
