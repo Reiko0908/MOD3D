@@ -17,15 +17,7 @@ We begin by considering a 2D scene, where the dominant scene geometry can be suf
 The induced image displacement field is represented using an 8-parameter quadratic parametric motion model [1]:
 
 $$
-\begin{bmatrix}
-u(x,y) \\
-v(x,y)
-\end{bmatrix}
-=
-\begin{bmatrix}
-a+bx+cy+gx^2+hxy \\
-d+ex+fy+gxy+hy^2
-\end{bmatrix}
+\begin{bmatrix} u(x,y) \\ v(x,y) \end{bmatrix} = \begin{bmatrix} a+bx+cy+gx^2+hxy \\ d+ex+fy+gxy+hy^2 \end{bmatrix}
 $$
 
 where $u(x,y)$ and $v(x,y)$ represent horizontal and vertical image displacement, respectively, and $(a,b,c,d,e,f,g,h)$ are the motion parameters.
@@ -37,15 +29,7 @@ Using multi-scale Gauss–Newton optimization, we estimate the dominant motion a
 We then evaluate the local gradient-normalized normal-flow residual to identify regions that remain significantly misaligned:
 
 $$
-M(x,y)=
-\frac{
-\displaystyle\sum_{(x',y')\in W(x,y)}
-\left|I_w(x',y')-I(x',y')\right|
-\|\nabla I(x',y')\|
-}{
-\displaystyle\sum_{(x',y')\in W(x,y)}
-\|\nabla I(x',y')\|^2+\varepsilon
-}
+M(x,y) = \frac{\sum_{(x',y')\in W(x,y)} |I_w(x',y')-I(x',y')| \|\nabla I(x',y')\|}{\sum_{(x',y')\in W(x,y)} \|\nabla I(x',y')\|^2 + \varepsilon}
 $$
 
 where:
@@ -65,7 +49,7 @@ In such cases, static objects at different depths exhibit different image displa
 To address this limitation, MOD3D progressively decomposes the image motion into additional planar layers and residual planar parallax [1].
 
 The process consists of:
-1. **Dominant-plane alignment:** Estimate and compensate for the primary background motion using the quadratic/homography parametric model.
+1. **Dominant-plane alignment:** Estimate and compensate for the primary background motion using the 2D parametric model.
 2. **Secondary-plane alignment:** Identify remaining misaligned regions and fit additional 2D parametric motion models to account for secondary rigid planar structures.
 3. **Residual parallax estimation:** Apply coarse-to-fine pyramidal Lucas–Kanade optical flow to the remaining misaligned regions, obtaining dense residual planar-parallax vectors $\vec{\mu}^{\,j}$ and $\vec{\mu}^{\,k}$ for the two inspection views.
 
@@ -79,7 +63,7 @@ The key observation is that static 3D points must satisfy a common projective st
 Consider two image points $\vec{p}_1$ and $\vec{p}_2$, with relative image separation:
 
 $$
-\Delta\vec{p}_w=\vec{p}_2-\vec{p}_1
+\Delta\vec{p}_w = \vec{p}_2 - \vec{p}_1
 $$
 
 Let $\vec{\mu}_1^{\,j}$ and $\vec{\mu}_2^{\,j}$ denote their residual parallax vectors in inspection view $j$, with corresponding vectors in view $k$.
@@ -87,22 +71,7 @@ Let $\vec{\mu}_1^{\,j}$ and $\vec{\mu}_2^{\,j}$ denote their residual parallax v
 For static 3D points, the following three-frame parallax rigidity constraint must hold [1]:
 
 $$
-\frac{
-\vec{\mu}_2^{j\,T}
-(\Delta\vec{p}_w)^j_{\perp}
-}{
-\vec{\mu}_1^{j\,T}
-(\Delta\vec{p}_w)^j_{\perp}
-}
--
-\frac{
-\vec{\mu}_2^{k\,T}
-(\Delta\vec{p}_w)^k_{\perp}
-}{
-\vec{\mu}_1^{k\,T}
-(\Delta\vec{p}_w)^k_{\perp}
-}
-=0
+\frac{\vec{\mu}_2^{j,T} (\Delta\vec{p}_w)^j_{\perp}}{\vec{\mu}_1^{j,T} (\Delta\vec{p}_w)^j_{\perp}} - \frac{\vec{\mu}_2^{k,T} (\Delta\vec{p}_w)^k_{\perp}}{\vec{\mu}_1^{k,T} (\Delta\vec{p}_w)^k_{\perp}} = 0
 $$
 
 Here, $(\Delta\vec{p}_w)^j_{\perp}$ and $(\Delta\vec{p}_w)^k_{\perp}$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
@@ -117,19 +86,11 @@ Motion evidence obtained from layered image alignment and projective rigidity is
 To obtain spatially consistent foreground masks, we convert the continuous motion evidence $s_p$ at each pixel $p$ into bounded log-odds unary potentials:
 
 $$
-\ell_p=
-\operatorname{clip}
-\left(
-k\ln\frac{\max(s_p,\varepsilon)}{\tau},
--\ell_{\max},
-\ell_{\max}
-\right)
+\ell_p = \mathrm{clip}\left(k\ln\frac{\max(s_p,\varepsilon)}{\tau}, -\ell_{\max}, \ell_{\max}\right)
 $$
 
 $$
-D_p(1)=\max(0,-\ell_p),
-\qquad
-D_p(0)=\max(0,\ell_p)
+D_p(1) = \max(0,-\ell_p), \qquad D_p(0) = \max(0,\ell_p)
 $$
 
 where:
@@ -138,16 +99,12 @@ where:
 - $\tau$ is the motion-evidence threshold.
 - $\varepsilon$ ensures numerical stability.
 - $\ell_{\max}$ limits the magnitude of the unary potentials.
-- $L_p\in\{0,1\}$ represents the pixel label, where $0$ denotes static background and $1$ denotes independently moving foreground.
+- $L_p \in \{0,1\}$ represents the pixel label, where $0$ denotes static background and $1$ denotes independently moving foreground.
 
 We formulate the segmentation problem as a binary Markov Random Field (MRF) energy minimization problem:
 
 $$
-E(L)=
-\sum_{p\in\mathcal{V}}D_p(L_p)
-+
-\sum_{(p,q)\in\mathcal{N}}
-w_{pq}\,\mathbb{I}[L_p\neq L_q]
+E(L) = \sum_{p\in\mathcal{V}} D_p(L_p) + \sum_{(p,q)\in\mathcal{N}} w_{pq}\,\mathbb{I}[L_p \neq L_q]
 $$
 
 where $\mathcal{V}$ denotes the set of image pixels and $\mathcal{N}$ is an 8-connected neighborhood.
@@ -155,14 +112,7 @@ where $\mathcal{V}$ denotes the set of image pixels and $\mathcal{N}$ is an 8-co
 The contrast-sensitive Potts pairwise weight is defined as:
 
 $$
-w_{pq}=
-\frac{\lambda}{\|p-q\|_2}
-\left(
-w_0+
-\exp\left(
--\frac{(I_p-I_q)^2}{2\sigma^2}
-\right)
-\right)
+w_{pq} = \frac{\lambda}{\|p-q\|_2}\left(w_0 + \exp\left(-\frac{(I_p-I_q)^2}{2\sigma^2}\right)\right)
 $$
 
 where:
