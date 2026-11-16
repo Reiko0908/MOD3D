@@ -66,7 +66,7 @@ $$
 \Delta\vec{p}_w = \vec{p}_2 - \vec{p}_1
 $$
 
-Let $\vec{\mu}_1^{\,j}$ and $\vec{\mu}_2^{\,j}$ denote their residual parallax vectors in inspection view $j$, with corresponding vectors in view $k$.
+Let $`\vec{\mu}_1^{\,j}`$ and $`\vec{\mu}_2^{\,j}`$ denote their residual parallax vectors in inspection view $j$, with corresponding vectors in view $k$.
 
 For static 3D points, the following three-frame parallax rigidity constraint must hold [1]:
 
@@ -74,7 +74,7 @@ $$
 \frac{\vec{\mu}_2^{j,T} (\Delta\vec{p}_w)^j_{\perp}}{\vec{\mu}_1^{j,T} (\Delta\vec{p}_w)^j_{\perp}} - \frac{\vec{\mu}_2^{k,T} (\Delta\vec{p}_w)^k_{\perp}}{\vec{\mu}_1^{k,T} (\Delta\vec{p}_w)^k_{\perp}} = 0
 $$
 
-Here, $(\Delta\vec{p}_w)^j_{\perp}$ and $(\Delta\vec{p}_w)^k_{\perp}$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
+Here, $\Delta\vec{p}_{w,\perp}^{\,j}$ and $\Delta\vec{p}_{w,\perp}^{\,k}$ denote the corresponding perpendicular components of the warped inter-point separation vectors used by the plane-plus-parallax geometry.
 
 The constraint measures the consistency of relative parallax across the two inspection views. Points that significantly violate this constraint relative to a consensus set of static reference points provide evidence of independent 3D motion.
 
@@ -124,7 +124,7 @@ where:
 
 The pairwise weights encourage neighboring pixels to share the same label while allowing discontinuities around strong image boundaries.
 
-Since all pairwise weights are nonnegative, the binary Potts energy is submodular. Therefore, its global minimum can be computed exactly using an equivalent minimum $s$-$t$ cut / maximum-flow formulation.
+Since all pairwise weights are nonnegative, the binary Potts energy is submodular. Therefore, its global minimum can be computed exactly using an equivalent minimum $s\text{-}t$ cut / maximum-flow formulation.
 
 MOD3D uses the Boykov–Kolmogorov algorithm to obtain the final spatially coherent foreground segmentation.
 

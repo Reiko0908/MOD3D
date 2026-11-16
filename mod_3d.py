@@ -18,10 +18,15 @@ Sections:
 
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import os
+import sys
 import time
+from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, replace, asdict
 
 import cv2
 import maxflow
@@ -29,9 +34,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ============================================================
+# =============================================================
 # 1. UTILITIES
-# ============================================================
+# =============================================================
 
 
 # -------------------------- Device --------------------------
@@ -201,9 +206,9 @@ def border_mask(H: int, W: int, margin: int, device) -> torch.Tensor:
     return m
 
 
-# ============================================================
+# =============================================================
 # 2. 2D PARAMETRIC MOTION + DOMINANT-MOTION INITIALIZATION
-# ===========================================================
+# ============================================================
 MODELS = {"translation", "affine", "quadratic", "homography"}
 
 # indices into the 8-vector for each model family
@@ -459,6 +464,7 @@ def est_dominant(
     warm: torch.Tensor | None = None,
     n_peaks: int = 3,
     align_thr: float = 0.6,
+    tex_thr: float = 2e-4,
 ) -> torch.Tensor:
     """Dominant 2D motion = the parametric motion that aligns the LARGEST image area."""
     B, _, H, W = insp.shape
@@ -480,15 +486,18 @@ def est_dominant(
     Wp, valid = warp_img(I, p, cfg.model)
     M, tex = norm_flow_misalign(R, Wp, 2)
     good = (
-        ((M < align_thr) & (tex > 2e-4) & valid).float().mean(dim=(1, 2, 3)).view(n, B)
+        ((M < align_thr) & (tex > tex_thr) & valid)
+        .float()
+        .mean(dim=(1, 2, 3))
+        .view(n, B)
     )
     best = good.argmax(0)  # (B,)
     return p.view(n, B, 8)[best, torch.arange(B, device=p.device)]
 
 
-# ============================================================
+# =============================================================
 # 3. LOCAL MISALIGNMENT
-# ============================================================
+# =============================================================
 @torch.no_grad()
 def norm_flow_misalign(
     ref: torch.Tensor,
@@ -520,9 +529,9 @@ def misalign_mask(
     return (M > thr) & (texture > tex_thr) & valid.bool()
 
 
-# ============================================================
+# =============================================================
 # 4. DENSE PLANAR-PARALLAX FLOW
-# ============================================================
+# =============================================================
 def _shift(img: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
     """out(x, y) = img(x + dx, y + dy) with replicate border."""
     if dx == 0 and dy == 0:
@@ -676,9 +685,9 @@ def dense_lk(
     return flow, conf
 
 
-# ============================================================
+# =============================================================
 # 5. PARALLAX RIGIDITY CONSTRAINT
-# ============================================================
+# =============================================================
 def _cross(ax, ay, bx, by):
     """Cross product of 2D vectors (ax, ay) x (bx, by)"""
     return ax * by - ay * bx
@@ -810,9 +819,9 @@ def inconsistency_map(
     return out.view(H, W), cnt.view(H, W)
 
 
-# ============================================================
+# =============================================================
 # 6. GRAPH-CUT LABELLING (Binary MRF, Max-Flow / Min-Cut)
-# ============================================================
+# =============================================================
 @dataclass
 class GraphCutConfig:
     solver: str = "bk"  # 'dinic' (SciPy) | 'bk' (PyMaxflow)
@@ -843,7 +852,7 @@ def layered_evidence(
     r: dict[str, np.ndarray], tex_thr: float = 2e-4
 ) -> tuple[np.ndarray, np.ndarray]:
     """Continuous layered motion evidence: misaligne w/ both plan and 2nd layer"""
-    s = np.minimum(["ev_plane"], r["ev_layer2"])
+    s = np.minimum(r["ev_plane"], r["ev_layer2"])
     measurable = (
         (r["tex_plane"] > tex_thr)
         & (r["tex_layer2"] > tex_thr)
@@ -1032,3 +1041,936 @@ def label_frame(
     else:
         hard.fill(False)
     return solve_binary(l, meas, r["gray"], cfg, hard_static=hard)
+
+
+# =============================================================
+# 7. MOVING OBJECT DETECTOR
+# ============================================================
+@dataclass
+class MODConfig:
+    # --- 2D parametric registration (Sec. 2) ---
+    model: str = "homography"
+    pyramid: str = "gaussian"
+    gn_iters: int = 12
+    init_peaks: int = 3
+    # --- misalignment detection (Sec. 2 / [14]) ---
+    misalign_thr: float = 0.6
+    misalign_radius: int = 2
+    texture_thr: float = 2e-4
+    # --- layers (Sec. 3) ---
+    use_layer2: bool = True
+    min_layer_frac: float = 0.01
+    # --- parallax (Sec. 4.1) ---
+    skip_3d: bool = (
+        False  # True skips Steps 7-9 (dense LK + rigidity) for pure 2D/layered speed
+    )
+    parallax: str = "dense"  # 'dense' | 'layers'
+    layer_init: bool = True
+    lk_radius: int = 3
+    lk_iters: int = 5
+    lk_search: int = 3
+    min_conf_rel: float = 0.1
+    flow_residual_thr: float = 0.0
+    # --- rigidity constraint (Sec. 4.2) ---
+    gap: int = 3
+    min_parallax: float = 0.7
+    n_candidates: int = 400
+    n_refs: int = 40
+    rigidity_thr: float = 1.2
+    rigidity_low: float = 0.3
+    rigidity_smooth: int = 2
+    rig_eps: float = 0.25
+    rig_min_dist: float = 8.0
+    rig_min_b: float = 0.5
+    ref_points: list[tuple[float, float]] | None = None
+    # --- stratification ---
+    stratify: bool = True
+    dominant_frac: float = 0.75
+    # --- labelling ---
+    labeling: str = (
+        "auto"  # 'auto' (graph-cut MRF) | 'threshold' (hysteresis + morphology)
+    )
+    gc: GraphCutConfig = field(default_factory=GraphCutConfig)
+    # --- post-processing ---
+    border: int = 10
+    open_radius: int = 1
+    close_radius: int = 2
+    min_area: int = 60
+    fill_holes: bool = True
+    final_close_frac: float = 0.012
+    hole_close_frac: float = 0.03
+    hole_thick_frac: float = 0.015
+    seed: int = 0
+
+    def param_cfg(self) -> ParamConfig:
+        return ParamConfig(model=self.model, pyramid=self.pyramid, iters=self.gn_iters)
+
+
+def _components(
+    m: np.ndarray, cfg: MODConfig, seeds: np.ndarray | None = None
+) -> np.ndarray:
+    m = m.astype(np.uint8)
+    if not m.any():
+        return m.astype(bool)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= cfg.min_area
+    if seeds is not None:
+        has_seed = np.zeros(n, bool)
+        has_seed[np.unique(lab[seeds & (m > 0)])] = True
+        keep &= has_seed
+    out = keep[lab].astype(np.uint8)
+    if cfg.fill_holes and out.any():
+        cnts, _ = cv2.findContours(out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(out, cnts, -1, 1, thickness=cv2.FILLED)
+    return out.astype(bool)
+
+
+def _close_fill(m: np.ndarray, radius: int) -> np.ndarray:
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    mc = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, k)
+    cnts, _ = cv2.findContours(mc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out = np.zeros_like(mc)
+    cv2.drawContours(out, cnts, -1, 1, thickness=cv2.FILLED)
+    return out > 0
+
+
+def _fill_thick_holes(
+    pre: np.ndarray, base: np.ndarray, big_radius: int, thick_radius: int
+) -> np.ndarray:
+    closed = _close_fill(pre, big_radius)
+    add = (closed & ~base).astype(np.uint8)
+    k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * thick_radius + 1, 2 * thick_radius + 1)
+    )
+    add = cv2.morphologyEx(add, cv2.MORPH_OPEN, k) > 0
+    return _close_fill(base | add, 1)
+
+
+def _largest_share(m: np.ndarray) -> float:
+    n, _, stats, _ = cv2.connectedComponentsWithStats(
+        m.astype(np.uint8), connectivity=8
+    )
+    if n <= 1:
+        return 0.0
+    a = stats[1:, cv2.CC_STAT_AREA]
+    return float(a.max() / a.sum())
+
+
+def _cleanup(
+    mask: torch.Tensor, cfg: MODConfig, seeds: torch.Tensor | None = None
+) -> np.ndarray:
+    m = mask.bool()
+    if cfg.open_radius > 0:
+        m = dilate(erode(m, cfg.open_radius), cfg.open_radius)
+    if cfg.close_radius > 0:
+        m = erode(dilate(m, cfg.close_radius), cfg.close_radius)
+    sd = None if seeds is None else seeds[0, 0].cpu().numpy().astype(bool)
+    return _components(m[0, 0].cpu().numpy(), cfg, sd)
+
+
+class MovingObjectDetector:
+    """Plane + parallax moving-object detector for monocular image sequences."""
+
+    def __init__(self, cfg: MODConfig | None = None, device: str | None = None):
+        self.cfg = MODConfig() if cfg is None else cfg
+        self.device = get_device(device)
+        self._init_p1: dict[tuple[int, int], torch.Tensor] = {}
+
+    @torch.no_grad()
+    def detect_tensors(
+        self,
+        ref: torch.Tensor,
+        Ij: torch.Tensor,
+        Ik: torch.Tensor,
+        init_key: tuple[int, int] | None = None,
+    ) -> dict[str, object]:
+        cfg = self.cfg
+        dev = self.device
+        H, W = ref.shape[-2:]
+        insp = torch.cat([Ij, Ik], 0)
+        bmask = border_mask(H, W, cfg.border, dev)
+        pc = cfg.param_cfg()
+
+        # ---- steps 1-2: dominant 2D parametric motion (batched over j, k)
+        init = self._init_p1.get(init_key) if init_key is not None else None
+        if cfg.init_peaks > 0:
+            p1 = est_dominant(
+                ref,
+                insp,
+                pc,
+                warm=init,
+                n_peaks=cfg.init_peaks,
+                align_thr=cfg.misalign_thr,
+                tex_thr=cfg.texture_thr,
+            )
+        else:
+            p1 = est_param(ref, insp, pc, init=init)
+        if init_key is not None:
+            self._init_p1[init_key] = p1.clone()
+
+        # ---- steps 3-4: align and detect misaligned regions
+        W1, valid1 = warp_img(insp, p1, cfg.model)
+        M1, tex = norm_flow_misalign(ref.expand_as(W1), W1, cfg.misalign_radius)
+        mis1 = misalign_mask(M1, tex, valid1, cfg.misalign_thr, cfg.texture_thr) & bmask
+        valid_both = valid1.all(0, keepdim=True) & bmask
+
+        # Photometric residual w.r.t. the dominant plane; also responds on
+        # untextured, smooth surfaces.
+        _d = (ref.expand_as(W1) - W1).abs()
+        _d = torch.where(valid1, _d, torch.full_like(_d, 1e9))
+        res_ph = _d.min(0, keepdim=True).values
+        res_ok = valid1.any(0, keepdim=True) & bmask
+        _v = res_ph[res_ok]
+        res_thr = (
+            float(
+                max(
+                    0.03,
+                    3.5 * 1.4826 * (_v - _v.median()).abs().median().item(),
+                )
+            )
+            if _v.numel()
+            else 0.03
+        )
+
+        mis1_both = mis1.all(0, keepdim=True)
+        mask_2d = mis1_both
+
+        # ---- steps 5-6: second 2D layer fitted on the misaligned regions only
+        p2 = None
+        mis2 = mis1.clone()
+        M2min, tex2min, valid2all = (
+            M1.min(0).values,
+            tex.min(0).values,
+            valid1.all(0),
+        )
+        frac = mis1.float().mean().item()
+        if cfg.use_layer2 and frac >= cfg.min_layer_frac:
+            roi = (dilate(mis1, 2) & valid1).float()
+            p2 = est_param(ref, insp, pc, roi=roi, init=p1)
+            W2, valid2 = warp_img(insp, p2, cfg.model)
+            M2, tex2 = norm_flow_misalign(ref.expand_as(W2), W2, cfg.misalign_radius)
+            mis2 = (
+                misalign_mask(M2, tex2, valid2, cfg.misalign_thr, cfg.texture_thr)
+                | ~valid2
+            )
+            M2min, tex2min, valid2all = (
+                M2.min(0).values,
+                tex2.min(0).values,
+                valid2.all(0),
+            )
+        mask_layered = (mis1 & mis2).all(0, keepdim=True)
+
+        # ---- steps 7-9: planar-parallax flow & 3D rigidity constraint
+        if cfg.skip_3d:
+            mu_j = torch.zeros(2, H, W, device=dev, dtype=ref.dtype)
+            mu_k = torch.zeros(2, H, W, device=dev, dtype=ref.dtype)
+            refs = {"pts": torch.zeros(0, 2, device=dev)}
+            m = torch.zeros_like(M1[:1])
+            reliable = valid_both
+            mask_3d = mask_layered
+            seeds_3d = None
+            used_3d = False
+        else:
+            u1 = displacement_px(p1, cfg.model, H, W)
+            if p2 is not None:
+                layer_par = (displacement_px(p2, cfg.model, H, W) - u1) * dilate(
+                    mis1, 2
+                ).float()
+            else:
+                layer_par = torch.zeros_like(u1)
+
+            if cfg.parallax == "layers":
+                mu = layer_par
+                conf = torch.ones_like(M1)
+            elif cfg.parallax == "dense":
+                mu, conf = dense_lk(
+                    ref,
+                    W1,
+                    init=layer_par if cfg.layer_init else None,
+                    iters=cfg.lk_iters,
+                    radius=cfg.lk_radius,
+                    search=cfg.lk_search,
+                )
+            else:
+                raise ValueError(cfg.parallax)
+
+            mu_j, mu_k = mu[0], mu[1]
+
+            if cfg.flow_residual_thr > 0:
+                Wmu = warp_by_flow(W1, mu)
+                Mres, _ = norm_flow_misalign(
+                    ref.expand_as(Wmu), Wmu, cfg.misalign_radius
+                )
+                flow_ok = (Mres < cfg.flow_residual_thr).all(
+                    0, keepdim=True
+                ) & flow_valid(mu).all(0, keepdim=True)
+            else:
+                flow_ok = torch.ones_like(M1[:1], dtype=torch.bool)
+
+            # ---- step 8: reference point(s) known / assumed to be static
+            cthr = cfg.min_conf_rel * conf.flatten(1).median(dim=1).values.view(
+                -1, 1, 1, 1
+            )
+            reliable = (conf >= cthr).all(0, keepdim=True) & flow_ok
+            mag = mu.norm(dim=1, keepdim=True)
+            cand = (
+                mis1_both
+                & reliable
+                & (mag >= cfg.min_parallax).all(0, keepdim=True)
+                & valid_both
+            )
+            user = (
+                torch.tensor(cfg.ref_points, dtype=torch.float32)
+                if cfg.ref_points
+                else None
+            )
+            kw = dict(eps=cfg.rig_eps, min_dist=cfg.rig_min_dist, min_b=cfg.rig_min_b)
+            refs = select_ref_points(
+                mu_j,
+                mu_k,
+                cand[0, 0],
+                cfg.n_candidates,
+                cfg.n_refs,
+                cfg.seed,
+                user_points=user,
+                **kw,
+            )
+
+            # ---- step 9: parallax-based rigidity constraint, Eq. (8)
+            region = mis1_both & valid_both & reliable
+            if refs["pts"].shape[0] > 0:
+                m, _ = inconsistency_map(mu_j, mu_k, refs, region=region[0, 0], **kw)
+                m = m[None, None]
+                if cfg.rigidity_smooth > 0:
+                    rf = region.float()
+                    m = (
+                        box_filter(m * rf, cfg.rigidity_smooth)
+                        / box_filter(rf, cfg.rigidity_smooth).clamp_min(1e-6)
+                        * rf
+                    )
+                mask_3d = (m > cfg.rigidity_low) & region
+                seeds_3d = (m > cfg.rigidity_thr) & region
+                used_3d = True
+            else:
+                m = torch.zeros_like(M1[:1])
+                mask_3d = mask_layered
+                seeds_3d = None
+                used_3d = False
+
+        m3d = _cleanup(mask_3d, cfg, seeds_3d)
+        m2d = _cleanup(mask_2d, cfg)
+        mlay = _cleanup(mask_layered, cfg)
+        level = "3d" if used_3d else "layered"
+        final = m3d
+        if cfg.stratify and used_3d and _largest_share(mlay) >= cfg.dominant_frac:
+            final, level = mlay, "layered"
+
+        pre_final = final
+        if cfg.final_close_frac > 0 and final.any():
+            final = _close_fill(final, max(1, int(round(cfg.final_close_frac * W))))
+            if cfg.hole_close_frac > 0:
+                final = _fill_thick_holes(
+                    pre_final,
+                    final,
+                    max(1, int(round(cfg.hole_close_frac * W))),
+                    max(1, int(round(cfg.hole_thick_frac * W))),
+                )
+
+        out: dict[str, object] = {
+            "pre_final": pre_final,
+            "textured": (tex > cfg.texture_thr).all(0)[0].cpu().numpy(),
+            "gray": (ref[0, 0].clamp(0, 1) * 255).byte().cpu().numpy(),
+            "mask": final,
+            "level": level,
+            "mask_3d": m3d,
+            "mask_2d": m2d,
+            "mask_layered": mlay,
+            "inconsistency": m[0, 0].cpu().numpy(),
+            "misalignment": M1.min(0).values[0].cpu().numpy(),
+            "parallax_j": mu_j.cpu().numpy(),
+            "parallax_k": mu_k.cpu().numpy(),
+            "ref_points": refs["pts"].cpu().numpy(),
+            "p1": p1.cpu().numpy(),
+            "p2": None if p2 is None else p2.cpu().numpy(),
+            "used_rigidity": used_3d,
+            "reliable": reliable[0, 0].cpu().numpy(),
+            "mis_both": mis1_both[0, 0].cpu().numpy(),
+            "ev_plane": M1.min(0).values[0].cpu().numpy(),
+            "tex_plane": tex.min(0).values[0].cpu().numpy(),
+            "ev_layer2": M2min[0].cpu().numpy(),
+            "tex_layer2": tex2min[0].cpu().numpy(),
+            "valid_both": valid_both[0, 0].cpu().numpy(),
+            "valid_layer2": valid2all[0].cpu().numpy(),
+            "res_plane": torch.where(res_ok, res_ph, torch.zeros_like(res_ph))[0, 0]
+            .cpu()
+            .numpy(),
+            "res_valid": res_ok[0, 0].cpu().numpy(),
+            "res_thr": res_thr,
+            "mask_threshold": final,
+            "mask_layered_gc": mlay,
+            "mask_3d_gc": m3d,
+        }
+
+        if cfg.labeling != "threshold":
+            lab_lay, info = label_frame(
+                out,
+                cfg.gc,
+                level="layered",
+                border=cfg.border,
+                tex_thr=cfg.texture_thr,
+            )
+            main_gc = _components(lab_lay, cfg)
+            out["mask_main_gc"] = main_gc
+            out["mask_layered_gc"] = main_gc
+            if cfg.gc.others:
+                out["mask_layered_gc"] = main_gc | secondary_objects(
+                    out,
+                    main_gc,
+                    cfg.gc,
+                    border=cfg.border,
+                    tex_thr=cfg.texture_thr,
+                )
+            out["graphcut_info"] = info
+
+            if used_3d:
+                lab_3d, _ = label_frame(
+                    out,
+                    cfg.gc,
+                    level="3d",
+                    border=cfg.border,
+                    tex_thr=cfg.texture_thr,
+                    rig_thr=cfg.rigidity_low,
+                )
+                out["mask_3d_gc"] = _components(
+                    lab_3d, cfg, seeds=seeds_3d[0, 0].cpu().numpy()
+                )
+
+            if level == "layered":
+                out["mask"] = out["mask_layered_gc"]
+            elif used_3d:
+                out["mask"] = out["mask_3d_gc"]
+
+        return out
+
+    def detect(
+        self,
+        ref: np.ndarray,
+        frame_j: np.ndarray,
+        frame_k: np.ndarray,
+        init_key: tuple[int, int] | None = None,
+    ) -> dict[str, object]:
+        return self.detect_tensors(
+            frame_to_tensor(ref, self.device),
+            frame_to_tensor(frame_j, self.device),
+            frame_to_tensor(frame_k, self.device),
+            init_key,
+        )
+
+    def triplet_indices(self, t: int, T: int) -> tuple[int, int]:
+        if T < 3:
+            raise ValueError(f"Need at least 3 frames to form a triplet, got T={T}")
+        g = min(self.cfg.gap, (T - 1) // 2)
+        if t - g >= 0 and t + g < T:
+            return t - g, t + g
+        if t + 2 * g < T:
+            return t + g, t + 2 * g
+        return max(t - 2 * g, 0), max(t - g, 0)
+
+    def process_sequence(
+        self, frames: Sequence[np.ndarray], callback=None, verbose: bool = True
+    ) -> list[dict[str, object]]:
+        """Run detection across an in-memory sequence of uint8 frames."""
+        T = len(frames)
+        tens: dict[int, torch.Tensor] = {}
+
+        def get(i: int) -> torch.Tensor:
+            if i not in tens:
+                tens[i] = frame_to_tensor(frames[i], self.device)
+            return tens[i]
+
+        results = []
+        t0 = time.time()
+        for t in range(T):
+            j, k = self.triplet_indices(t, T)
+            res = self.detect_tensors(get(t), get(j), get(k), init_key=(j - t, k - t))
+            res["frame"], res["j"], res["k"] = t, j, k
+            results.append(res)
+            for old in [i for i in tens if i < t - 2 * self.cfg.gap]:
+                del tens[old]
+            if callback is not None:
+                callback(t, res)
+            if verbose and (t % 10 == 0 or t == T - 1):
+                print(
+                    f"[MOD] frame {t + 1}/{T}  "
+                    f"({(time.time() - t0) / (t + 1):.2f} s/frame, "
+                    f"device={self.device})",
+                    flush=True,
+                )
+        return results
+
+    process_video = process_sequence
+
+
+# ============================================================
+# 8. COMMAND-LINE INTERFACE
+# ============================================================
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "video",
+        help="input monocular video file, or a folder of frames (jpg/png, sorted by name)",
+    )
+    ap.add_argument(
+        "--gt",
+        default=None,
+        help="optional folder of ground-truth binary mask images (sorted by name) to compute IoU",
+    )
+    ap.add_argument("--out", default="mod_out", help="output directory")
+    ap.add_argument(
+        "--device",
+        default=None,
+        help="cuda | cuda:1 | cpu | mps (default: cuda if available)",
+    )
+    ap.add_argument(
+        "--width",
+        type=int,
+        default=640,
+        help="resize frames to this width (0 = keep)",
+    )
+    ap.add_argument("--start", type=int, default=0, help="first frame index")
+    ap.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="process at most N frames (0 = all)",
+    )
+    ap.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="temporal subsampling of the input video",
+    )
+    ap.add_argument(
+        "--gap",
+        type=int,
+        default=3,
+        help="offset of frames j/k from the reference frame",
+    )
+    ap.add_argument(
+        "--model",
+        default="homography",
+        choices=["homography", "quadratic", "affine", "translation"],
+        help="2D parametric model of the dominant plane",
+    )
+    ap.add_argument(
+        "--mode",
+        default="auto",
+        choices=["auto", "stratified", "3d", "layered", "2d"],
+        help="auto: layered level + graph-cut labelling + further moving objects (default); "
+        "layered: same, main object only (no further-object pass); "
+        "stratified: per-frame choice between layered level and 3D rigidity; "
+        "3d: always parallax rigidity; 2d: single plane",
+    )
+    ap.add_argument(
+        "--parallax",
+        default="dense",
+        choices=["dense", "layers"],
+        help="dense: per-pixel residual flow; layers: u2 - u1",
+    )
+    ap.add_argument(
+        "--rigidity-thr",
+        type=float,
+        default=None,
+        help="seed threshold on inconsistency [px]",
+    )
+    ap.add_argument(
+        "--rigidity-low",
+        type=float,
+        default=None,
+        help="hysteresis low threshold [px]",
+    )
+    ap.add_argument(
+        "--misalign-thr",
+        type=float,
+        default=None,
+        help="normal-flow misalignment threshold [px]",
+    )
+    ap.add_argument(
+        "--labeling",
+        default="auto",
+        choices=["auto", "threshold"],
+        help="auto: graph-cut energy minimisation; threshold: hysteresis + morphology",
+    )
+    ap.add_argument(
+        "--gc-lam",
+        type=float,
+        default=None,
+        help="graph-cut smoothness weight (default 8)",
+    )
+    ap.add_argument(
+        "--no-others",
+        action="store_true",
+        help="do not search for further moving objects",
+    )
+    ap.add_argument(
+        "--others-lam",
+        type=float,
+        default=None,
+        help="smoothness weight of second pass",
+    )
+    ap.add_argument(
+        "--gc-solver",
+        default="bk",
+        choices=["bk"],
+        help="max-flow solver: bk (Boykov-Kolmogorov via PyMaxflow)",
+    )
+    ap.add_argument(
+        "--ref",
+        action="append",
+        default=None,
+        metavar="X,Y",
+        help="static reference point (x, y)",
+    )
+    ap.add_argument("--save-masks", action="store_true")
+    ap.add_argument("--panel", action="store_true")
+    ap.add_argument("--alpha", type=float, default=0.5, help="overlay opacity")
+    ap.add_argument("--fps", type=float, default=0, help="output fps")
+    return ap.parse_args(argv)
+
+
+class VideoSource:
+    """Video file or folder of frames. Yields (original_bgr, processing_bgr)."""
+
+    def __init__(self, path, width=0, start=0, step=1, max_frames=0, fps=25.0):
+        self.width, self.start, self.step, self.max = (
+            width,
+            start,
+            step,
+            max_frames,
+        )
+        self.files = None
+        if os.path.isdir(path):
+            ext = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+            self.files = sorted(
+                os.path.join(path, f)
+                for f in os.listdir(path)
+                if f.lower().endswith(ext)
+            )
+            if not self.files:
+                raise IOError(f"no image frames in folder {path!r}")
+            self.fps = fps
+        else:
+            self.cap = cv2.VideoCapture(path)
+            if not self.cap.isOpened():
+                raise IOError(f"cannot open video {path!r}")
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or fps
+            if start > 0:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+
+    def _read(self):
+        if self.files is not None:
+            for f in self.files[self.start :]:
+                yield cv2.imread(f, cv2.IMREAD_COLOR)
+        else:
+            while True:
+                ok, frame = self.cap.read()
+                if not ok:
+                    break
+                yield frame
+            self.cap.release()
+
+    def __iter__(self):
+        n = 0
+        for i, frame in enumerate(self._read()):
+            if i % self.step:
+                continue
+            small = frame
+            if self.width and frame.shape[1] != self.width:
+                h = int(round(frame.shape[0] * self.width / frame.shape[1] / 2) * 2)
+                small = cv2.resize(frame, (self.width, h), interpolation=cv2.INTER_AREA)
+            yield frame, small
+            n += 1
+            if self.max and n >= self.max:
+                break
+
+
+class VideoSink:
+    """H.264 via imageio-ffmpeg when available, otherwise OpenCV mp4v."""
+
+    def __init__(self, path, fps):
+        self.path, self.fps, self.w = path, fps, None
+        try:
+            import imageio.v2 as iio
+
+            self.w = iio.get_writer(
+                path,
+                fps=fps,
+                codec="libx264",
+                quality=8,
+                macro_block_size=2,
+                pixelformat="yuv420p",
+            )
+            self.kind = "imageio"
+        except Exception:
+            self.kind = "cv2"
+
+    def write(self, bgr):
+        if self.kind == "imageio":
+            self.w.append_data(bgr[..., ::-1])
+        else:
+            if self.w is None:
+                h, w = bgr.shape[:2]
+                self.w = cv2.VideoWriter(
+                    self.path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self.fps,
+                    (w, h),
+                )
+            self.w.write(bgr)
+
+    def close(self):
+        if self.w is not None:
+            self.w.close() if self.kind == "imageio" else self.w.release()
+
+
+def load_gt_masks(
+    path: str, start: int = 0, step: int = 1, max_frames: int = 0
+) -> list[np.ndarray]:
+    """Load sorted ground-truth mask images as boolean arrays."""
+    ext = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    files = sorted(
+        os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(ext)
+    )
+    if not files:
+        raise IOError(f"no ground-truth mask images in folder {path!r}")
+    masks = []
+    for i, f in enumerate(files[start:]):
+        if i % step:
+            continue
+        gt = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+        masks.append(gt > 0)
+        if max_frames and len(masks) >= max_frames:
+            break
+    return masks
+
+
+def compute_iou(pred: np.ndarray, gt: np.ndarray) -> float:
+    """Compute binary Intersection over Union (returns 1.0 if both masks are empty)."""
+    if pred.shape != gt.shape:
+        pred = (
+            cv2.resize(
+                pred.astype(np.uint8),
+                (gt.shape[1], gt.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            > 0
+        )
+    inter = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    return float(inter / union) if union > 0 else 1.0
+
+
+def overlay(frame, mask, color=(0, 0, 255), alpha=0.5):
+    """Colour fill blended with alpha + 2 px contour."""
+    out = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    col = np.zeros_like(out)
+    col[:] = color
+    out[mask] = (alpha * col[mask] + (1 - alpha) * out[mask]).astype(np.uint8)
+    cnts, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(out, cnts, -1, color, 2)
+    return out
+
+
+def render_overlay(bgr, mask, incons=None, refs=None, vmax=2.0, panel=False, alpha=0.5):
+    """bgr at output resolution; mask / incons / refs at processing resolution."""
+    H, W = bgr.shape[:2]
+    sx, sy = W / mask.shape[1], H / mask.shape[0]
+    if mask.shape != (H, W):
+        mask = (
+            cv2.resize(mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+            > 0
+        )
+    out = overlay(bgr, mask, alpha=alpha)
+    if not panel or incons is None:
+        return out
+    if refs is not None:
+        for x, y in refs[:60]:
+            cv2.circle(out, (int(x * sx), int(y * sy)), 2, (255, 255, 0), -1)
+    incons = cv2.resize(
+        incons.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR
+    )
+    hm = np.clip(incons / vmax, 0, 1)
+    hm = cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+    cv2.putText(
+        hm,
+        "rigidity inconsistency",
+        (6, 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+    )
+    return np.concatenate([out, hm], 1)
+
+
+def main(argv=None):
+    a = parse_args(argv)
+    os.makedirs(a.out, exist_ok=True)
+    skip_3d = a.mode in ("auto", "layered", "2d")
+    cfg = MODConfig(
+        model=a.model,
+        gap=a.gap,
+        parallax=a.parallax,
+        labeling=a.labeling,
+        skip_3d=skip_3d,
+    )
+    if a.gc_lam is not None:
+        cfg.gc.lam = a.gc_lam
+    if a.no_others or a.mode == "layered":
+        cfg.gc.others = False
+    if a.others_lam is not None:
+        cfg.gc.others_lam = a.others_lam
+    if a.rigidity_thr is not None:
+        cfg.rigidity_thr = a.rigidity_thr
+    if a.rigidity_low is not None:
+        cfg.rigidity_low = a.rigidity_low
+    if a.misalign_thr is not None:
+        cfg.misalign_thr = a.misalign_thr
+    if a.ref:
+        cfg.ref_points = [tuple(float(v) for v in r.split(",")) for r in a.ref]
+    det = MovingObjectDetector(cfg, device=a.device)
+    src = VideoSource(
+        a.video,
+        a.width,
+        a.start,
+        a.step,
+        a.max_frames,
+        fps=a.fps or 25.0,
+    )
+    gt_masks = load_gt_masks(a.gt, a.start, a.step, a.max_frames) if a.gt else None
+    fps = a.fps or src.fps / a.step
+    ov_sink = VideoSink(os.path.join(a.out, "overlay.mp4"), fps)
+    mk_sink = VideoSink(os.path.join(a.out, "mask.mp4"), fps)
+    if a.save_masks:
+        os.makedirs(os.path.join(a.out, "masks"), exist_ok=True)
+    key = {
+        "auto": "mask_layered_gc" if a.labeling == "auto" else "mask",
+        "stratified": "mask",
+        "3d": "mask_3d_gc" if a.labeling == "auto" else "mask_3d",
+        "2d": "mask_2d",
+        "layered": ("mask_layered" if a.labeling == "threshold" else "mask_layered_gc"),
+    }[a.mode]
+    if a.mode != "stratified" and not (a.mode == "auto" and a.labeling == "threshold"):
+        cfg.stratify = False
+    print(
+        f"[MOD] device={det.device}  model={cfg.model}  mode={a.mode}  gap={cfg.gap}",
+        flush=True,
+    )
+
+    g = cfg.gap
+    buf: OrderedDict[int, tuple] = OrderedDict()
+    stats, t_next, t0 = [], 0, time.time()
+
+    def process(t, last_idx):
+        T = last_idx + 1
+        j, k = det.triplet_indices(t, T)
+        if j not in buf or k not in buf:
+            return False
+        res = det.detect_tensors(
+            buf[t][1], buf[j][1], buf[k][1], init_key=(j - t, k - t)
+        )
+        m = res[key]
+        orig = buf[t][2]
+        mo = (
+            cv2.resize(
+                m.astype(np.uint8),
+                (orig.shape[1], orig.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            > 0
+        )
+        ov_sink.write(
+            render_overlay(
+                orig,
+                m,
+                res["inconsistency"],
+                res["ref_points"],
+                panel=a.panel,
+                alpha=a.alpha,
+            )
+        )
+        mk_sink.write(np.repeat((mo * 255).astype(np.uint8)[..., None], 3, 2))
+        if a.save_masks:
+            cv2.imwrite(
+                os.path.join(a.out, "masks", f"{t:05d}.png"),
+                (mo * 255).astype(np.uint8),
+            )
+        frame_stat = {
+            "frame": t,
+            "j": j,
+            "k": k,
+            "moving_px": int(mo.sum()),
+            "level": res.get("level", a.mode),
+            "n_refs": int(len(res["ref_points"])),
+            "used_rigidity": bool(res["used_rigidity"]),
+        }
+        if gt_masks is not None and t < len(gt_masks):
+            frame_stat["iou"] = round(compute_iou(mo, gt_masks[t]), 4)
+        stats.append(frame_stat)
+        if t % 10 == 0:
+            el = time.time() - t0
+            iou_str = f"  IoU={frame_stat['iou']:.3f}" if "iou" in frame_stat else ""
+            print(
+                f"[MOD] frame {t}  moving_px={int(m.sum())}  refs={len(res['ref_points'])}{iou_str}  "
+                f"{el / (t + 1):.2f} s/frame",
+                flush=True,
+            )
+        return True
+
+    last = -1
+    for idx, (orig, bgr) in enumerate(src):
+        buf[idx] = (bgr, frame_to_tensor(bgr, det.device), orig)
+        last = idx
+        while (t_next + g <= idx and t_next - g >= 0) or (
+            t_next < g and t_next + 2 * g <= idx
+        ):
+            process(t_next, 10**9)
+            t_next += 1
+        for old in [i for i in buf if i < t_next - 2 * g]:
+            del buf[old]
+    while t_next <= last:
+        process(t_next, last)
+        t_next += 1
+    ov_sink.close()
+    mk_sink.close()
+    el = time.time() - t0
+    ious = [s["iou"] for s in stats if "iou" in s]
+    mean_iou = float(np.mean(ious)) if ious else None
+    summary = {
+        "input": os.path.abspath(a.video),
+        "frames_processed": len(stats),
+        "seconds": el,
+        "seconds_per_frame": el / max(len(stats), 1),
+        "device": str(det.device),
+        "mode": a.mode,
+        "mean_iou": round(mean_iou, 4) if mean_iou is not None else None,
+        "config": asdict(cfg),
+        "per_frame": stats,
+    }
+    with open(os.path.join(a.out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+    miou_msg = f"  mIoU={mean_iou:.4f}" if mean_iou is not None else ""
+    print(
+        f"[MOD] done: {len(stats)} frames in {el:.1f}s{miou_msg} -> {a.out}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
